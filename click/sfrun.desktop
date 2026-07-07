@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Sailfish Apps
+Comment=Set up the SailfishOS runtime and install/run Sailfish apps
+Type=Application
+Exec=qmlscene %u Main.qml
+Icon=sfrun.svg
+Terminal=false
+X-Lomiri-Touch=true

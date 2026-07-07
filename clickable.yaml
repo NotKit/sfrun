@@ -1,0 +1,22 @@
+clickable_minimum_required: 8.4.0
+# 24.04-1.x runs on every UT 24.04 release (24.04-2.x would exclude pre-24.04.2
+# devices; nothing here needs 2.x APIs)
+framework: ubuntu-touch-24.04-1.x
+
+builder: custom
+build: |
+  set -e
+  # cross-build the LD_PRELOAD shim out of tree
+  mkdir -p "$BUILD_DIR/shim"
+  cp "$SRC_DIR"/shim/sailfish_shim.c "$SRC_DIR"/shim/Makefile "$BUILD_DIR/shim/"
+  make -C "$BUILD_DIR/shim" CC="$ARCH_TRIPLET-gcc"
+  # stage the click payload (code only; all data lives in $XDG_DATA_HOME/<pkg>)
+  install -Dm755 "$SRC_DIR/sfrun"                     "$INSTALL_DIR/sfrun"
+  install -Dm755 "$BUILD_DIR/shim/libsailfish-shim.so" "$INSTALL_DIR/shim/libsailfish-shim.so"
+  # QML control-panel UI (pyotherside backend + Lomiri QML)
+  install -Dm644 "$SRC_DIR/ui/Main.qml"                "$INSTALL_DIR/Main.qml"
+  install -Dm644 "$SRC_DIR/ui/backend.py"              "$INSTALL_DIR/backend.py"
+  install -Dm644 "$SRC_DIR/click/manifest.json"        "$INSTALL_DIR/manifest.json"
+  install -Dm644 "$SRC_DIR/click/sfrun.apparmor" "$INSTALL_DIR/sfrun.apparmor"
+  install -Dm644 "$SRC_DIR/click/sfrun.desktop"  "$INSTALL_DIR/sfrun.desktop"
+  install -Dm644 "$SRC_DIR/click/sfrun.svg"      "$INSTALL_DIR/sfrun.svg"

@@ -1,0 +1,936 @@
+#!/usr/bin/env python3
+"""sfrun - run Harbour Sailfish apps on Ubuntu Touch in a bwrap sandbox.
+
+A Sailfish SDK target rootfs is mounted as the guest userspace inside an
+unprivileged bubblewrap mount namespace; the host libhybris GL stack + Android
+HAL are bound in; and the guest talks *directly* to Lomiri's Wayland compositor
+over wl_shell. No container daemon, no nested compositor, no protocol proxy.
+
+The bind/env recipe here is the one validated by Spike 1 on a MediaTek/Mali
+UT 24.04 device (see spike/SPIKE1-FINDINGS.md). The key libhybris-on-UT pieces:
+  - explicit Wayland EGL platform (eglGetPlatformDisplayEXT), EGL_PLATFORM=wayland
+  - HYBRIS_LD_LIBRARY_PATH  : Android linker search path (VNDK/HAL libs)
+  - HYBRIS_LINKER_DIR       : override hardcoded /usr/lib/.../libhybris/linker
+  - HYBRIS_EGLPLATFORM_DIR  : where eglplatform_wayland.so lives
+  - __EGL_VENDOR_LIBRARY_DIRS: host glvnd vendor JSON (guest /usr has none)
+  - bind /dev/__properties__ + /android (with /apex,/linkerconfig symlinks)
+  - DESKTOP_FILE_HINT=lomiri : satisfy Lomiri's Wayland confinement
+
+Subcommands:
+  doctor              Preflight checks.
+  bootstrap [src]     Populate the guest rootfs from an SDK target tarball/dir
+                      (no arg: download the latest target from Jolla).
+  prepare-gl          Build the curated host-GL stack (run once, on-device).
+  run <app> [args]    Launch an installed app id (or absolute binary path).
+  spike               Run the bundled wl_shell+EGL test client (Spike 1).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import getpass
+import tarfile
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Layout. Everything lives under BASE (the project dir) because the UT rootfs
+# is read-only; BASE must be on a writable fs (e.g. /home/phablet/sfrun).
+# --------------------------------------------------------------------------
+
+# CODE lives with the script (HERE: sfrun + shim/ + spike/), DATA lives under BASE
+# (rootfs/, home/, hostgl/, glvnd/). They are decoupled so the script can be
+# installed somewhere fixed and read-only (a click package under
+# /opt/click.ubuntu.com/<pkg>/<version>/) while data sits in the user's XDG dir.
+# Resolution order for BASE: $SFRUN_BASE, else the script dir if it already
+# holds a rootfs (in-place/dev layout), else $XDG_DATA_HOME/<click pkg name>
+# (the UT per-app data convention), else $XDG_DATA_HOME/sfrun.
+HERE = Path(__file__).resolve().parent
+SELF = Path(__file__).resolve()
+
+# Click package roots on Ubuntu Touch (user-installed, preinstalled).
+CLICK_ROOTS = ("/opt/click.ubuntu.com", "/usr/share/click/preinstalled")
+
+
+def _click_pkg() -> str | None:
+    """Click package name when running from an installed click
+    (<root>/<pkg>/<version>/sfrun), else None."""
+    for root in CLICK_ROOTS:
+        try:
+            return SELF.relative_to(root).parts[0]
+        except ValueError:
+            continue
+    aid = os.environ.get("APP_ID", "")  # click launch: <pkg>_<app>_<version>
+    if aid.count("_") >= 2:
+        return aid.split("_")[0]
+    return None
+
+
+def stable_self() -> Path:
+    """Path to this script that survives click upgrades: inside a click install
+    prefer the package's `current` symlink over the versioned directory."""
+    for root in CLICK_ROOTS:
+        try:
+            rel = SELF.relative_to(root)
+        except ValueError:
+            continue
+        cur = Path(root, rel.parts[0], "current", *rel.parts[2:])
+        if cur.exists():
+            return cur
+    return SELF
+
+
+def _default_base() -> Path:
+    if (HERE / "rootfs").is_dir() or (HERE / "home").is_dir():
+        return HERE
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    return Path(xdg) / (_click_pkg() or "sfrun")
+
+
+BASE = Path(os.environ["SFRUN_BASE"]) if os.environ.get("SFRUN_BASE") else _default_base()
+ROOTFS = Path(os.environ.get("SFRUN_ROOTFS", str(BASE / "rootfs")))
+HOSTGL = Path(os.environ.get("SFRUN_HOSTGL", str(BASE / "hostgl")))
+GLVND = Path(os.environ.get("SFRUN_GLVND", str(BASE / "glvnd")))
+# Single shared guest home, like a real Sailfish device (apps separate their data
+# by ~/.local/share/<App>). Runs as the device user (Sailfish allows any login
+# name), so the uid resolves in passwd (needed by dbus/dconf).
+DEV_USER = os.environ.get("SFRUN_USER", getpass.getuser())
+DEV_UID = os.getuid()
+DEV_GID = os.getgid()
+GUEST_HOME = f"/home/{DEV_USER}"
+HOME_DIR = Path(os.environ.get("SFRUN_HOME", str(BASE / "home")))
+# CODE dir is exposed at /sfcode inside the sandbox; DATA dir (BASE) at /sfhome.
+SHIM = Path(os.environ.get("SFRUN_SHIM", str(HERE / "shim" / "libsailfish-shim.so")))
+SHIM_GUEST = "/sfcode/shim/libsailfish-shim.so"
+
+# Host libhybris install dir (multiarch triplet on UT).
+HOST_TRIPLET = Path(os.environ.get("SFRUN_HOST_TRIPLET", "/usr/lib/aarch64-linux-gnu"))
+HOST_GLVND_VENDOR = Path("/usr/share/glvnd/egl_vendor.d")
+
+# Android runtime knobs. SDK version drives the VNDK apex path.
+ANDROID_SDK = os.environ.get("SFRUN_ANDROID_SDK", "")  # autodetected if empty
+
+# Where SDK target tarballs are fetched from (bootstrap downloads straight from
+# Jolla to the user's device — we never redistribute the rootfs ourselves).
+SDK_TARGETS_URL = os.environ.get(
+    "SFRUN_TARGETS_URL", "https://releases.sailfishos.org/sdk/targets/")
+TARGET_ARCH = os.environ.get("SFRUN_TARGET_ARCH", "aarch64")
+
+
+# --------------------------------------------------------------------------
+# Host -> guest binds.
+#   HAL_BINDS : libhybris Android roots + the /android tree (apex/linkerconfig).
+#   DEV_NODES : GPU + IPC + Android property store. Bound if present on host.
+# --------------------------------------------------------------------------
+
+HAL_BINDS = ["/system", "/vendor", "/odm", "/android"]
+
+DEV_NODES = [
+    "/dev/dri", "/dev/mali0", "/dev/kgsl-3d0",        # GPU (Mali or Adreno)
+    "/dev/ion", "/dev/dma_heap",                       # buffer allocators
+    "/dev/binder", "/dev/hwbinder", "/dev/vndbinder",  # binder IPC
+    "/dev/__properties__", "/dev/socket",              # Android property store
+]
+
+# Guest rootfs top-level dirs we provide ourselves (don't ro-bind from rootfs).
+PROVIDED = {"dev", "proc", "tmp", "run", "sys",
+            "system", "vendor", "odm", "android", "apex", "linkerconfig", "home"}
+
+# Host GL/hybris libs to copy into the curated HOSTGL dir (prepare-gl). Real
+# copies, not symlinks (symlinks would dangle inside the namespace). Core glibc
+# libs are deliberately excluded so the guest's newer glibc stays in use.
+GL_LIB_PATTERNS = [
+    "libEGL*", "libGLES*", "libGL.so*", "libGLdispatch*", "libOpenGL*",
+    "libGLX*", "libglvnd*", "libgbm*", "libdrm*", "libwayland-egl*",
+    "libhybris*", "libhardware*", "libsync*", "libglapi*", "libexpat*",
+    "libgralloc*", "libui*", "libcutils*", "libutils*",
+    # bionic-TLS reservation shim: libhybris GL stores the EGL context in a
+    # bionic TLS slot that clobbers glibc TLS across threads without this.
+    # UT preloads it into every hybris Qt app.
+    "libtls-padding*",
+]
+
+
+def android_sdk() -> str:
+    if ANDROID_SDK:
+        return ANDROID_SDK
+    try:
+        out = subprocess.run(["getprop", "ro.build.version.sdk"],
+                             capture_output=True, text=True, timeout=5)
+        v = out.stdout.strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    return "34"
+
+
+def hybris_ld_library_path() -> str:
+    sdk = android_sdk()
+    return ":".join([
+        "/system/lib64",
+        f"/apex/com.android.vndk.v{sdk}/lib64",
+        "/vendor/lib64/hw", "/vendor/lib64/egl", "/vendor/lib64",
+    ])
+
+
+# --------------------------------------------------------------------------
+# Environment handed to the guest process.
+# --------------------------------------------------------------------------
+
+def guest_env(app_data: Path) -> dict[str, str]:
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    wl = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+    env = {
+        "HOME": GUEST_HOME,
+        "USER": DEV_USER,
+        "XDG_RUNTIME_DIR": xdg,
+        "WAYLAND_DISPLAY": wl,
+        # talk straight to Lomiri over wl_shell. Do NOT set
+        # QT_WAYLAND_SHELL_INTEGRATION: when set, Sailfish's QtWayland 5.6 uses
+        # the plugin factory (its wayland-shell-integration dir is empty -> null
+        # -> crash). When unset, it falls to a *built-in* path that does
+        # `new QWaylandWlShellIntegration` directly once it sees the wl_shell
+        # registry global (which Lomiri advertises). See spike/SPIKE2-FINDINGS.
+        "QT_QPA_PLATFORM": "wayland",
+        # Maliit keyboard: both SFOS and UT use Maliit 2.3.x over D-Bus.
+        # The session bus (bound from host) carries org.maliit.Server.Address
+        # which points the input context plugin to the maliit-server socket.
+        "QT_IM_MODULE": "maliit",
+        "QT_WAYLAND_DISABLE_WINDOWDECORATION": "1",
+        # libhybris EGL can't share a GL context across threads, so the
+        # threaded scene-graph render loop aborts ("makeCurrent in a different
+        # thread"). Force the single-threaded render loop.
+        "QSG_RENDER_LOOP": "basic",
+        # --- the validated libhybris-on-UT EGL recipe ---
+        "EGL_PLATFORM": "wayland",
+        "HYBRIS_EGLPLATFORM": "wayland",
+        "HYBRIS_EGLPLATFORM_DIR": "/hostgl",
+        "HYBRIS_LINKER_DIR": "/hostgl/linker",
+        "HYBRIS_ANDROID_SDK_VERSION": android_sdk(),
+        "HYBRIS_LD_LIBRARY_PATH": hybris_ld_library_path(),
+        "__EGL_VENDOR_LIBRARY_DIRS": "/hostglvnd",
+        "LD_LIBRARY_PATH": "/hostgl:/usr/lib64:/lib64",
+        # Lomiri Wayland confinement needs a desktop hint to allow the connection.
+        # When launched from a .desktop, Lomiri sets DESKTOP_FILE_HINT itself —
+        # inherit that; only default to "lomiri" for a manual CLI launch.
+        "DESKTOP_FILE_HINT": os.environ.get("DESKTOP_FILE_HINT", "lomiri"),
+        # Silica theme / QML lookup (guest libdir is /usr/lib64).
+        "XDG_DATA_DIRS": "/usr/share",
+        "QML2_IMPORT_PATH": "/usr/lib64/qt5/qml",
+        "QT_PLUGIN_PATH": "/usr/lib64/qt5/plugins",
+        # tls-padding is mandatory for hybris GL; the compat shim is optional
+        # (referenced at its in-sandbox /sfcode path).
+        "LD_PRELOAD": ":".join(p for p in ("/hostgl/libtls-padding.so",
+                                           SHIM_GUEST if SHIM.exists() else "") if p),
+    }
+    for k in ("LANG", "LC_ALL", "DBUS_SESSION_BUS_ADDRESS",
+              "DBUS_SYSTEM_BUS_ADDRESS", "SFRUN_DEBUG"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    # Allow overriding selected keys from the caller's env (debugging: shell
+    # integration, Qt/scene-graph logging) without editing this file.
+    # NOTE: QT_QPA_PLATFORM is deliberately NOT inherited. Lomiri injects a
+    # multi-value list (e.g. "ubuntumirclient;wayland-egl;xcb") which Sailfish's
+    # Qt 5.6 rejects; we always force the single value "wayland" set above.
+    for k in ("QT_WAYLAND_SHELL_INTEGRATION", "QT_WAYLAND_USE_XDG_SHELL",
+              "QT_LOGGING_RULES", "QSG_INFO", "QT_QPA_EGLFS_DEBUG",
+              "QT_DEBUG_PLUGINS", "QT_WAYLAND_DISABLE_WINDOWDECORATION",
+              # Sailfish routes Qt logging to journald by default; force stderr.
+              "QT_LOGGING_TO_CONSOLE", "QT_MESSAGE_PATTERN"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env
+
+
+# --------------------------------------------------------------------------
+# bwrap argv assembly
+# --------------------------------------------------------------------------
+
+def ensure_user() -> None:
+    """Make the device user resolvable inside the guest (dbus/dconf/getpwuid need
+    it). Sailfish allows any login name, so we reuse the host user + uid; written
+    host-side into the rootfs passwd/group (idempotent)."""
+    pw, gr = ROOTFS / "etc/passwd", ROOTFS / "etc/group"
+    if pw.is_file() and not any(l.startswith(DEV_USER + ":")
+                                for l in pw.read_text().splitlines()):
+        pw.write_text(pw.read_text().rstrip("\n") +
+                      f"\n{DEV_USER}:x:{DEV_UID}:{DEV_GID}:{DEV_USER}:{GUEST_HOME}:/bin/bash\n")
+    if gr.is_file() and not any(l.startswith(DEV_USER + ":")
+                                for l in gr.read_text().splitlines()):
+        gr.write_text(gr.read_text().rstrip("\n") + f"\n{DEV_USER}:x:{DEV_GID}:\n")
+
+
+def build_bwrap_argv(inner_argv: list[str]) -> list[str]:
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap <src>` first")
+    if not HOSTGL.is_dir() or not (HOSTGL / "linker").is_dir():
+        die(f"host-GL stack not built at {HOSTGL}; run `sfrun prepare-gl` first")
+    ensure_user()
+
+    argv: list[str] = [
+        "bwrap",
+        "--unshare-user", "--unshare-ipc", "--die-with-parent",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--tmpfs", "/run",
+    ]
+
+    # guest rootfs as / (top dirs individually; skip what we provide ourselves).
+    for entry in sorted(ROOTFS.iterdir(), key=lambda p: p.name):
+        if entry.name in PROVIDED:
+            continue
+        argv += ["--ro-bind", str(entry), f"/{entry.name}"]
+
+    # libhybris HAL roots + android tree.
+    for p in HAL_BINDS:
+        if Path(p).exists():
+            argv += ["--ro-bind", p, p]
+        else:
+            warn(f"skip HAL bind (missing): {p}")
+    # apex / linkerconfig are symlinks into /android on UT; recreate them.
+    if Path("/android").exists():
+        argv += ["--symlink", "/android/apex", "/apex",
+                 "--symlink", "/android/linkerconfig", "/linkerconfig"]
+
+    # curated host GL stack + host glvnd vendor JSON.
+    argv += ["--ro-bind", str(HOSTGL), "/hostgl"]
+    argv += ["--ro-bind", str(GLVND), "/hostglvnd"]
+
+    # GPU / IPC / property-store device nodes (only those present).
+    for node in DEV_NODES:
+        if Path(node).exists():
+            argv += ["--dev-bind", node, node]
+
+    # host runtime dir (Wayland + pulse + dbus session sockets).
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if Path(xdg).exists():
+        argv += ["--bind", xdg, xdg]
+
+    # host system D-Bus socket (connman, ofono live here).
+    for sysbus in ("/run/dbus/system_bus_socket", "/var/run/dbus/system_bus_socket"):
+        if Path(sysbus).exists():
+            # rw-bind the socket + its parent dir so the guest can find it.
+            argv += ["--bind", str(Path(sysbus).parent), str(Path(sysbus).parent)]
+            break
+
+    # host DNS resolution (resolv.conf + hosts).
+    for dns in ("/etc/resolv.conf", "/etc/hosts"):
+        if Path(dns).exists():
+            argv += ["--ro-bind", dns, dns]
+
+    # single shared writable HOME (like a real device; apps split data by subdir).
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    argv += ["--bind", str(HOME_DIR), GUEST_HOME]
+    # data dir at /sfhome, code dir (shim, spike) at /sfcode.
+    argv += ["--ro-bind", str(BASE), "/sfhome"]
+    argv += ["--ro-bind", str(HERE), "/sfcode"]
+
+    argv += ["--clearenv"]
+    for k, v in guest_env(HOME_DIR).items():
+        if v:
+            argv += ["--setenv", k, v]
+
+    argv += ["--"]
+    argv += inner_argv
+    return argv
+
+
+# --------------------------------------------------------------------------
+# Subcommands
+# --------------------------------------------------------------------------
+
+def cmd_doctor(_args) -> int:
+    ok = True
+
+    def check(label: str, good: bool, hint: str = "") -> None:
+        nonlocal ok
+        print(f"[{'OK ' if good else 'FAIL'}] {label}")
+        if not good and hint:
+            print(f"       -> {hint}")
+        ok = ok and good
+
+    check("bwrap present", shutil.which("bwrap") is not None, "install bubblewrap")
+
+    mun = Path("/proc/sys/user/max_user_namespaces")
+    val = mun.read_text().strip() if mun.exists() else "0"
+    check("user namespaces available", val not in ("", "0"),
+          "kernel must allow user namespaces for bwrap")
+
+    check(f"guest rootfs at {ROOTFS}", ROOTFS.is_dir(),
+          "run `sfrun bootstrap <sdk-target>`")
+    check(f"host-GL stack at {HOSTGL}", HOSTGL.is_dir() and (HOSTGL / "linker").is_dir(),
+          "run `sfrun prepare-gl`")
+    check(f"glvnd vendor JSON at {GLVND}", GLVND.is_dir() and any(GLVND.glob("*.json")),
+          "run `sfrun prepare-gl`")
+    check(f"compiled shim at {SHIM}", SHIM.exists(), "build it: make -C shim (optional)")
+
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    wl = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+    check(f"host Wayland socket {xdg}/{wl}", (Path(xdg) / wl).exists(),
+          "run inside a Lomiri session")
+
+    print(f"\nandroid sdk = {android_sdk()}")
+    print(f"HYBRIS_LD_LIBRARY_PATH = {hybris_ld_library_path()}")
+    print("\nHAL binds / dev nodes present on this host:")
+    for p in HAL_BINDS + DEV_NODES:
+        print(f"   [{'+' if Path(p).exists() else '-'}]  {p}")
+    return 0 if ok else 1
+
+
+def fetch_target(version: str, arch: str) -> Path:
+    """Download an SDK target tarball into BASE/cache, verified against the
+    server's .md5sum. Resumes a partial download; reuses a cached copy that
+    still verifies. `version` is e.g. 5.1.0.11 or `latest`."""
+    import hashlib
+    import urllib.request as rq
+
+    name = f"Sailfish_OS-{version}-Sailfish_SDK_Target-{arch}.tar.7z"
+    url = SDK_TARGETS_URL + name
+    cache = BASE / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    dst = cache / name
+    part = dst.with_name(dst.name + ".part")
+
+    try:
+        with rq.urlopen(url + ".md5sum", timeout=30) as r:
+            want_md5 = r.read().decode().split()[0]
+    except Exception as e:
+        die(f"cannot fetch {url}.md5sum: {e}")
+
+    def md5_of(p: Path) -> str:
+        h = hashlib.md5()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    if dst.exists():
+        if md5_of(dst) == want_md5:
+            print(f"using cached {dst}")
+            return dst
+        print(f"cached {dst} fails md5 (stale 'latest'?); re-downloading")
+        dst.unlink()
+
+    have = part.stat().st_size if part.exists() else 0
+    req = rq.Request(url)
+    if have:
+        req.add_header("Range", f"bytes={have}-")
+    try:
+        r = rq.urlopen(req, timeout=60)
+    except Exception as e:
+        die(f"cannot fetch {url}: {e}")
+    with r:
+        if have and r.status != 206:   # server ignored the Range; start over
+            have = 0
+        total = have + int(r.headers.get("Content-Length") or 0)
+        print(f"downloading {url}"
+              + (f" (resuming at {have >> 20} MiB)" if have else ""))
+        done, last_pct = have, -5
+        with open(part, "ab" if have else "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                pct = done * 100 // total if total else 0
+                if pct >= last_pct + 5:
+                    print(f"  {done >> 20} / {total >> 20} MiB ({pct}%)",
+                          flush=True)
+                    last_pct = pct
+    if md5_of(part) != want_md5:
+        die(f"md5 mismatch for {part}; delete it and retry")
+    part.rename(dst)
+    return dst
+
+
+def cmd_bootstrap(args) -> int:
+    """Populate ROOTFS from an SDK target tarball (.tar / .tar.7z) or a dir.
+
+    With no source (or a version number / `latest`), the target is downloaded
+    from SDK_TARGETS_URL — straight from Jolla to this machine, cached under
+    BASE/cache. .tar.7z needs `7zz`/`7z` on PATH (the build sysroot still lacks
+    the runtime QML/theme packages -- see README).
+    """
+    src_arg = args.src or "latest"
+    if Path(src_arg).exists():
+        src = Path(src_arg)
+    elif src_arg == "latest" or src_arg.replace(".", "").isdigit():
+        src = fetch_target(src_arg, args.arch)
+    else:
+        die(f"source not found: {src_arg}")
+        return 1
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    if any(ROOTFS.iterdir()) and not args.force:
+        die(f"{ROOTFS} is not empty; pass --force to overwrite")
+
+    if src.is_dir():
+        print(f"copying {src} -> {ROOTFS}")
+        shutil.copytree(src, ROOTFS, dirs_exist_ok=True, symlinks=True)
+    elif src.name.endswith(".7z") or src.name.endswith(".tar.7z"):
+        sevenz = shutil.which("7zz") or shutil.which("7z") or shutil.which("7za")
+        if not sevenz:
+            die("need 7zz/7z to extract a .7z; install p7zip or fetch a static 7zz")
+        print(f"extracting (via {sevenz}) {src} -> {ROOTFS}")
+        p1 = subprocess.Popen([sevenz, "x", "-so", str(src)], stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(["tar", "-C", str(ROOTFS), "--exclude=./dev/*", "-xf", "-"],
+                              stdin=p1.stdout)
+        p1.stdout.close()
+        p2.communicate()
+    else:
+        print(f"extracting {src} -> {ROOTFS}")
+        with tarfile.open(src) as tf:
+            tf.extractall(ROOTFS)
+
+    (ROOTFS / "home" / "nemo").mkdir(parents=True, exist_ok=True)
+    print("done. run `sfrun prepare-gl` then `sfrun doctor`.")
+    return 0
+
+
+def cmd_prepare_gl(_args) -> int:
+    """Build the curated host-GL stack: real copies of the host libhybris GL
+    libs (+ eglplatform plugins + android linker shims) and the glvnd vendor
+    JSON. Run once on the device; re-run after a host GL update."""
+    if not HOST_TRIPLET.is_dir():
+        die(f"host libhybris dir not found: {HOST_TRIPLET}")
+
+    if HOSTGL.exists():
+        shutil.rmtree(HOSTGL)
+    (HOSTGL / "linker").mkdir(parents=True)
+    GLVND.mkdir(parents=True, exist_ok=True)
+
+    n = 0
+    for pat in GL_LIB_PATTERNS:
+        for f in HOST_TRIPLET.glob(pat):
+            if f.is_file():
+                shutil.copy(f, HOSTGL / f.name)  # follows symlinks -> real file
+                n += 1
+    # libhybris eglplatform_*.so + hwcomposer plugins (flat; found via env dir).
+    plugdir = HOST_TRIPLET / "libhybris"
+    for f in plugdir.glob("*.so"):
+        shutil.copy(f, HOSTGL / f.name); n += 1
+    # android linker shims (q.so etc.)
+    for f in (plugdir / "linker").glob("*.so"):
+        shutil.copy(f, HOSTGL / "linker" / f.name); n += 1
+    # glvnd vendor JSON (points to libEGL_libhybris.so.0 via LD_LIBRARY_PATH).
+    for j in HOST_GLVND_VENDOR.glob("*libhybris*.json"):
+        shutil.copy(j, GLVND / j.name)
+    if not any(GLVND.glob("*.json")):
+        warn(f"no libhybris glvnd vendor JSON found in {HOST_GLVND_VENDOR}")
+
+    print(f"copied {n} libs into {HOSTGL}")
+    print(f"linkers: {sorted(p.name for p in (HOSTGL / 'linker').glob('*.so'))}")
+    print(f"glvnd:   {sorted(p.name for p in GLVND.glob('*.json'))}")
+    return 0
+
+
+# Silica patches: Sailfish's ApplicationWindow assumes Lipstick (a cover window
+# it manages, and a compositor-drawn ambience behind a translucent app). Neither
+# exists on Lomiri, so we patch the rootfs QML to (1) skip cover creation and
+# (2) paint a blurred in-window ambience. Idempotent (marker-guarded), keeps a
+# .orig backup. Re-run after a rootfs rebuild / Silica update.
+SILICA_AW = "usr/lib64/qt5/qml/Sailfish/Silica/ApplicationWindow.qml"
+AMBIENCE_WALLPAPER = os.environ.get(
+    "SFRUN_WALLPAPER",
+    "/usr/share/themes/sailfish-default/silica/images/wallpaper.jpg")
+
+
+def cmd_patch_silica(_args) -> int:
+    aw = ROOTFS / SILICA_AW
+    if not aw.is_file():
+        die(f"{aw} not found; install sailfishsilica-qt5 into the rootfs first")
+    text = aw.read_text()
+    if "sfrun" in text:
+        print("Silica already patched (sfrun marker present); skipping")
+        return 0
+    backup = aw.with_suffix(".qml.orig")
+    if not backup.exists():
+        backup.write_text(text)
+
+    out: list[str] = []
+    cover_done = wp_done = False
+    for line in text.split("\n"):
+        out.append(line)
+        if line.strip() == "function _loadCover() {":
+            out.append("        return // sfrun: covers do not map to Lomiri")
+            cover_done = True
+        if line.strip() == "id: wallpaper":
+            out += [
+                "        Background.ThemeImageWallpaper { // sfrun: in-window blurred ambience",
+                "            anchors.fill: parent; z: -10000",
+                "            fillMode: Image.PreserveAspectCrop",
+                f'            imageUrl: "{AMBIENCE_WALLPAPER}"',
+                "        }",
+            ]
+            wp_done = True
+    if not (cover_done and wp_done):
+        die(f"patch anchors not found (cover={cover_done} wallpaper={wp_done}); "
+            f"Silica layout changed — inspect {aw}")
+    aw.write_text("\n".join(out))
+    print(f"patched {aw}\n  - cover window disabled\n  - in-window blurred ambience ({AMBIENCE_WALLPAPER})\n  backup: {backup}")
+    return 0
+
+
+def cmd_run(args) -> int:
+    app = args.app
+    inner = ([app] if app.startswith("/") else [f"/usr/bin/{app}"]) + args.app_args
+    argv = build_bwrap_argv(inner)
+    if os.environ.get("SFRUN_DEBUG"):
+        print("+ " + " ".join(argv), file=sys.stderr)
+    os.execvp(argv[0], argv)
+    return 127
+
+
+def manage_argv(inner: list[str]) -> list[str]:
+    """bwrap argv for the writable, fake-root maintenance sandbox (rootfs rw,
+    network + DNS, project at /sfhome). Shared by `manage`, `set-scale`, and the
+    zypper steps."""
+    argv = [
+        "bwrap", "--unshare-user", "--uid", "0", "--gid", "0", "--unshare-ipc",
+        "--bind", str(ROOTFS), "/",            # WRITABLE rootfs
+        "--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/tmp",
+        "--ro-bind", str(BASE), "/sfhome",
+        "--setenv", "PATH", "/usr/bin:/bin:/usr/sbin:/sbin",
+        "--setenv", "HOME", "/root",
+    ]
+    if Path("/etc/resolv.conf").exists():
+        argv += ["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
+    return argv + ["--"] + inner
+
+
+def cmd_manage(args) -> int:
+    """Writable, fake-root maintenance shell (or command) inside the rootfs with
+    network + DNS — for zypper/rpm/patching, à la sdk-assistant. Same sandbox used
+    at bootstrap time, exposed so you don't hand-roll bwrap. The project dir is at
+    /sfhome (e.g. `sfrun manage zypper in /sfhome/foo.rpm`)."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}")
+    argv = manage_argv(args.cmd or ["/bin/bash"])
+    if os.environ.get("SFRUN_DEBUG"):
+        print("+ " + " ".join(argv), file=sys.stderr)
+    os.execvp(argv[0], argv)
+    return 127
+
+
+# Silica picks graphics for these discrete zoom levels; snap the ratio to one so
+# the matching sailfish-content-graphics-default-z<ratio> assets line up.
+ZOOM_LEVELS = [1.0, 1.25, 1.5, 1.75, 2.0]
+# UT's legacy GRID_UNIT_PX maps to a Silica pixel ratio; on this device 21 -> 1.5.
+GRID_UNIT_BASE = float(os.environ.get("SFRUN_GRID_BASE", "14"))
+
+
+def zoom_tag(ratio: float) -> str:
+    """The zoom suffix Jolla uses for the graphics packages: always at least one
+    decimal (z1.0, z1.25, z1.5, z2.0) — `%g` would wrongly drop it to z1/z2."""
+    s = f"{ratio:.2f}".rstrip("0")
+    return s + "0" if s.endswith(".") else s
+
+
+def cmd_set_scale(args) -> int:
+    """Set Silica's theme pixel ratio in the *user* dconf (where Sailfish keeps
+    it). Silica reads /desktop/sailfish/silica/theme_pixel_ratio from dconf; we
+    derive the value from UT's legacy GRID_UNIT_PX env (ratio = GRID_UNIT_PX / 14,
+    snapped to a Silica zoom level) unless an explicit ratio is given. Written by
+    `dconf write` as the regular user into the shared home, so every app reads it."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}")
+    ensure_user()
+    ratio = args.ratio
+    if ratio is None:
+        grid = os.environ.get("GRID_UNIT_PX")
+        if grid:
+            ratio = float(grid) / GRID_UNIT_BASE
+            print(f"derived ratio {ratio:.3f} from GRID_UNIT_PX={grid}")
+        else:
+            die("no ratio given and GRID_UNIT_PX not set; pass e.g. `set-scale 1.5`")
+    snapped = min(ZOOM_LEVELS, key=lambda z: abs(z - ratio))
+    if abs(snapped - ratio) > 1e-6:
+        print(f"snapping {ratio:.3f} -> {snapped} (nearest Silica zoom level)")
+    ratio = snapped
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+
+    # dconf write needs a session bus + the dconf service; run a private bus as
+    # the regular user (uid resolves via passwd) with a 0700 runtime dir. The db
+    # lands in the shared home's ~/.config/dconf/user, read by every app.
+    shell = (
+        "mkdir -p /run/xr && chmod 700 /run/xr && "
+        "dbus-run-session -- sh -c '"
+        "/usr/libexec/dconf-service & sleep 2; "
+        f"dconf write /desktop/sailfish/silica/theme_pixel_ratio {ratio}; "
+        "dconf read /desktop/sailfish/silica/theme_pixel_ratio'")
+    argv = [
+        "bwrap", "--unshare-user", "--unshare-ipc",
+        "--bind", str(ROOTFS), "/", "--proc", "/proc", "--dev-bind", "/dev", "/dev",
+        "--tmpfs", "/tmp", "--tmpfs", "/run",
+        "--bind", str(HOME_DIR), GUEST_HOME,
+        "--setenv", "HOME", GUEST_HOME, "--setenv", "USER", DEV_USER,
+        "--setenv", "XDG_CONFIG_HOME", f"{GUEST_HOME}/.config",
+        "--setenv", "XDG_RUNTIME_DIR", "/run/xr",
+        "--setenv", "PATH", "/usr/bin:/bin",
+        "--", "/bin/sh", "-c", shell,
+    ]
+    if os.environ.get("SFRUN_DEBUG"):
+        print("+ " + " ".join(argv), file=sys.stderr)
+    r = subprocess.run(argv)
+    if r.returncode != 0:
+        die("dconf write failed")
+    print(f"theme_pixel_ratio = {ratio}  (user dconf in {HOME_DIR}/.config/dconf/user)")
+    print(f"NOTE: for crisp graphics also install the matching zoom assets:\n"
+          f"  sfrun manage zypper in sailfish-content-graphics-default-z{zoom_tag(ratio)}")
+    return 0
+
+
+def cmd_shell(args) -> int:
+    """Shell (or command) in the normal app-context sandbox (read-only rootfs,
+    full GL/Wayland env) — for debugging an app's runtime environment."""
+    inner = args.cmd or ["/bin/bash"]
+    argv = build_bwrap_argv(inner)
+    if os.environ.get("SFRUN_DEBUG"):
+        print("+ " + " ".join(argv), file=sys.stderr)
+    os.execvp(argv[0], argv)
+    return 127
+
+
+def resolve_ratio(explicit) -> float:
+    """Pick a Silica zoom level from an explicit value or UT's GRID_UNIT_PX env."""
+    if explicit is not None:
+        r = float(explicit)
+    else:
+        grid = os.environ.get("GRID_UNIT_PX")
+        r = float(grid) / GRID_UNIT_BASE if grid else 1.5
+    return min(ZOOM_LEVELS, key=lambda z: abs(z - r))
+
+
+# Runtime packages the SDK *build* target lacks but apps need at run time. The
+# matching graphics zoom (sailfish-content-graphics-default-z<ratio>) is appended.
+RUNTIME_PACKAGES = [
+    "qt5-qtdeclarative-qmlscene",         # qmlscene runtime
+    "qt5-qtsvg-plugin-imageformat-svg",   # SVG icons/emoji (QImage svg plugin)
+    "sailfishsilica-qt5",                 # Silica QML
+    "sailfish-content-graphics-default",  # base theme graphics
+]
+
+
+def cmd_prepare_rootfs(args) -> int:
+    """Install the runtime packages the build sysroot lacks (qmlscene, the SVG
+    image plugin, Silica theme graphics incl. the zoom assets matching the scale).
+    Runs in the manage sandbox; safe to re-run."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap <src>` first")
+    ratio = resolve_ratio(args.scale)
+    tag = zoom_tag(ratio)
+    pkgs = RUNTIME_PACKAGES + [f"sailfish-content-graphics-default-z{tag}"]
+    print(f"installing runtime packages (scale z{tag}):\n  " + "\n  ".join(pkgs))
+    argv = manage_argv(["zypper", "--non-interactive", "--no-gpg-checks", "in"] + pkgs)
+    r = subprocess.run(argv)
+    if r.returncode not in (0, 4):   # 4 = nothing to do / already installed bits
+        die(f"zypper install failed (exit {r.returncode})")
+    print("done.")
+    return 0
+
+
+def cmd_setup(args) -> int:
+    """Full bring-up after `bootstrap`: build the host-GL stack, install the
+    runtime packages, patch Silica, and set the theme scale — in order. Each step
+    is idempotent, so this is safe to re-run. Scale defaults to the GRID_UNIT_PX
+    env (Lomiri sets it) snapped to a Silica zoom level."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap` first")
+    ratio = resolve_ratio(args.scale)
+    steps = [
+        ("prepare-gl", lambda: cmd_prepare_gl(args)),
+        ("prepare-rootfs", lambda: cmd_prepare_rootfs(argparse.Namespace(scale=ratio))),
+        ("patch-silica", lambda: cmd_patch_silica(args)),
+        ("set-scale", lambda: cmd_set_scale(argparse.Namespace(ratio=ratio))),
+    ]
+    for name, fn in steps:
+        print(f"=== {name} ===", flush=True)
+        if fn() not in (0, None):
+            die(f"{name} failed")
+    print("=== setup complete ===")
+    return 0
+
+
+def cmd_install_rpm(args) -> int:
+    """Install a local .rpm into the rootfs, resolving deps from the configured
+    repos. The rpm is staged into BASE/cache so it is visible inside the manage
+    sandbox (which binds BASE read-only at /sfhome)."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap` first")
+    rpm = Path(args.rpm)
+    if not rpm.is_file() or rpm.suffix != ".rpm":
+        die(f"not an .rpm file: {rpm}")
+    cache = BASE / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    staged = cache / rpm.name
+    if rpm.resolve() != staged.resolve():
+        shutil.copy(rpm, staged)
+    print(f"installing {rpm.name}")
+    argv = manage_argv(["zypper", "--non-interactive", "--no-gpg-checks", "in",
+                        f"/sfhome/cache/{rpm.name}"])
+    r = subprocess.run(argv)
+    if r.returncode not in (0, 4):
+        die(f"zypper install failed (exit {r.returncode})")
+    print("done.")
+    return 0
+
+
+# App-id prefixes for third-party (Jolla Store / Chum / OpenRepos) apps — what a
+# user actually installs, as opposed to the SDK rootfs's own system entries.
+APP_PREFIXES = ("harbour-", "openrepos-")
+
+
+def cmd_list_apps(_args) -> int:
+    """List installable third-party apps present in the rootfs, TAB-separated as
+    `id<TAB>name<TAB>has_launcher(0|1)` — one per line, for the GUI to parse."""
+    appsdir = ROOTFS / "usr/share/applications"
+    host_apps = Path.home() / ".local/share/applications"
+    if not appsdir.is_dir():
+        return 0
+    for desk in sorted(appsdir.glob("*.desktop")):
+        appid = desk.stem
+        if not appid.startswith(APP_PREFIXES):
+            continue
+        name, hidden = appid, False
+        try:
+            for line in desk.read_text(errors="replace").splitlines():
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip()
+                if k == "Name" and name == appid:
+                    name = v
+                elif k == "NoDisplay" and v.lower() == "true":
+                    hidden = True
+        except OSError:
+            pass
+        if hidden:
+            continue
+        launched = 1 if (host_apps / f"sfrun-{appid}.desktop").exists() else 0
+        print(f"{appid}\t{name}\t{launched}")
+    return 0
+
+
+def cmd_make_desktop(args) -> int:
+    """Generate a host .desktop launcher for an installed app, derived from the
+    app's own .desktop inside the target, with Exec rewritten to call this sfrun.
+    Icons are copied into the host XDG icon dir so the entry is path-independent."""
+    appid = args.app
+    src = ROOTFS / "usr/share/applications" / f"{appid}.desktop"
+    if not src.is_file():
+        die(f"{src} not found; is '{appid}' installed in the rootfs?")
+
+    launcher = stable_self()  # click installs: use the `current` symlink so the
+    icon_name = None          # launcher survives package upgrades
+    out_lines: list[str] = []
+    for line in src.read_text().splitlines():
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key == "Exec":
+            out_lines.append(f"Exec={launcher} run {appid}")
+        elif key == "Icon":
+            icon_name = line.split("=", 1)[1].strip()
+            out_lines.append(line)  # keep; we copy the icon into the host theme
+        elif key in ("DBusActivatable",):
+            continue  # not applicable under sfrun
+        else:
+            out_lines.append(line)
+
+    # Copy the app's icons from the target into the host XDG icon theme so the
+    # launcher resolves them without referencing the rootfs path.
+    copied = 0
+    if icon_name and not icon_name.startswith("/"):
+        host_icons = Path.home() / ".local/share/icons/hicolor"
+        for png in (ROOTFS / "usr/share/icons/hicolor").glob(f"*/apps/{icon_name}.*"):
+            rel = png.relative_to(ROOTFS / "usr/share/icons/hicolor")
+            dst = host_icons / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(png, dst)
+            copied += 1
+
+    apps_dir = Path.home() / ".local/share/applications"
+    apps_dir.mkdir(parents=True, exist_ok=True)
+    out = apps_dir / f"sfrun-{appid}.desktop"
+    out.write_text("\n".join(out_lines) + "\n")
+    out.chmod(0o755)
+    print(f"wrote {out}\n  Exec={launcher} run {appid}\n  icons copied: {copied}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# helpers / CLI
+# --------------------------------------------------------------------------
+
+def warn(msg: str) -> None:
+    print(f"sfrun: warning: {msg}", file=sys.stderr)
+
+
+def die(msg: str) -> None:
+    print(f"sfrun: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="sfrun", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("doctor", help="preflight checks").set_defaults(fn=cmd_doctor)
+
+    b = sub.add_parser("bootstrap", help="populate guest rootfs from SDK target")
+    b.add_argument("src", nargs="?",
+                   help="SDK target tarball (.tar/.tar.7z) or extracted dir; or a "
+                        "version like 5.1.0.11 to download (default: latest)")
+    b.add_argument("--arch", default=TARGET_ARCH,
+                   help=f"target arch when downloading (default: {TARGET_ARCH})")
+    b.add_argument("--force", action="store_true", help="overwrite a non-empty rootfs")
+    b.set_defaults(fn=cmd_bootstrap)
+
+    sub.add_parser("prepare-gl", help="build curated host-GL stack").set_defaults(fn=cmd_prepare_gl)
+
+    pr = sub.add_parser("prepare-rootfs", help="install runtime packages (qmlscene, svg, theme graphics)")
+    pr.add_argument("--scale", type=float, help="zoom level for graphics (default from GRID_UNIT_PX or 1.5)")
+    pr.set_defaults(fn=cmd_prepare_rootfs)
+
+    sub.add_parser("patch-silica", help="patch Silica QML (cover off, in-window ambience)").set_defaults(fn=cmd_patch_silica)
+
+    st = sub.add_parser("setup", help="full bring-up: prepare-gl + prepare-rootfs + patch-silica + set-scale")
+    st.add_argument("--scale", type=float, help="zoom level (default from GRID_UNIT_PX)")
+    st.set_defaults(fn=cmd_setup)
+
+    ir = sub.add_parser("install-rpm", help="install a local .rpm into the rootfs (deps from repos)")
+    ir.add_argument("rpm", help="path to a .rpm file")
+    ir.set_defaults(fn=cmd_install_rpm)
+
+    sub.add_parser("list-apps", help="list installed third-party apps (id/name/launcher, TAB-separated)").set_defaults(fn=cmd_list_apps)
+
+    md = sub.add_parser("make-desktop", help="generate a host .desktop launcher for an installed app")
+    md.add_argument("app", help="app id (matches /usr/share/applications/<id>.desktop in the target)")
+    md.set_defaults(fn=cmd_make_desktop)
+
+    ss = sub.add_parser("set-scale", help="set Silica theme pixel ratio in user dconf")
+    ss.add_argument("ratio", nargs="?", type=float,
+                    help="pixel ratio (e.g. 1.5); default derived from GRID_UNIT_PX")
+    ss.set_defaults(fn=cmd_set_scale)
+
+    r = sub.add_parser("run", help="launch an app id or absolute binary")
+    r.add_argument("app", help="app id (-> /usr/bin/<id>) or absolute path")
+    r.add_argument("app_args", nargs=argparse.REMAINDER, help="args passed to the app")
+    r.set_defaults(fn=cmd_run)
+
+    mg = sub.add_parser("manage", help="writable fake-root maintenance shell (zypper/rpm/patch), like sdk-assistant")
+    mg.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run (default: bash)")
+    mg.set_defaults(fn=cmd_manage)
+
+    sh = sub.add_parser("shell", help="shell in the app sandbox (read-only, full env)")
+    sh.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run (default: bash)")
+    sh.set_defaults(fn=cmd_shell)
+
+    args = p.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,15 @@
+{
+    "name": "sfrun.thekit",
+    "title": "Sailfish Apps",
+    "description": "Run unmodified Harbour-compliant SailfishOS apps on Ubuntu Touch",
+    "version": "0.1.0",
+    "maintainer": "TheKit <thekit@disroot.org>",
+    "architecture": "@CLICK_ARCH@",
+    "framework": "@CLICK_FRAMEWORK@",
+    "hooks": {
+        "sfrun": {
+            "apparmor": "sfrun.apparmor",
+            "desktop": "sfrun.desktop"
+        }
+    }
+}

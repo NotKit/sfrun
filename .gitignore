@@ -1,0 +1,16 @@
+# clickable build output
+/build/
+*.click
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# compiled shim (rebuilt by `make -C shim` / clickable)
+shim/*.so
+
+# local Claude Code settings
+.claude/settings.local.json
+
+# original brainstorming transcript (kept out of the repo)
+2026-06-24-232948-*.txt

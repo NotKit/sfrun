@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1c5d91"/>
+      <stop offset="1" stop-color="#0b2e4f"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="48" fill="url(#bg)"/>
+  <!-- stylized sail -->
+  <path d="M128 40 L128 176 L60 176 Q108 132 128 40 Z" fill="#ffffff" opacity="0.92"/>
+  <path d="M140 56 L140 176 L196 176 Q152 140 140 56 Z" fill="#e8734a"/>
+  <!-- hull -->
+  <path d="M48 192 L208 192 Q196 220 168 220 L88 220 Q60 220 48 192 Z" fill="#ffffff" opacity="0.92"/>
+</svg>
