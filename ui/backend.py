@@ -64,6 +64,14 @@ def install_rpm(path):
     _run_op("install", ["install-rpm", path])
 
 
+def install_pkg(name):
+    _run_op("install", ["install-pkg", name])
+
+
+def chum_enable():
+    _run_op("chum", ["chum", "enable"])
+
+
 def make_desktop(appid):
     _run_op("desktop", ["make-desktop", appid])
 
@@ -115,3 +123,15 @@ def list_rpms():
                 seen.add(rp)
                 out.append({"path": f, "name": os.path.basename(f)})
     return out
+
+
+def chum_list():
+    out = subprocess.run(_argv(["chum", "list"]), capture_output=True,
+                         text=True).stdout
+    apps = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            apps.append({"name": parts[0], "summary": parts[1],
+                         "installed": parts[2] == "1"})
+    return apps

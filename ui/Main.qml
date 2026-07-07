@@ -16,6 +16,7 @@ MainView {
     property string opLog: ""
     property int   opProgress: 0   // 0 = indeterminate / no download %
     property int   opRc: -1
+    property var   opOnDone: null  // optional callback(rc) run when an op finishes
 
     property var statusRows: []
     property bool rootfsReady: false
@@ -32,12 +33,13 @@ MainView {
 
     // Begin a streaming operation: reset the log, show the log page, then invoke
     // the backend call (passed as a closure so buttons stay declarative).
-    function startOp(title, invoke) {
+    function startOp(title, invoke, onDone) {
         if (root.opRunning) return;
         root.opTitle = title;
         root.opLog = "";
         root.opProgress = 0;
         root.opRc = -1;
+        root.opOnDone = onDone || null;
         root.opRunning = true;
         stack.push(logPage);
         invoke();
@@ -60,6 +62,11 @@ MainView {
                 root.opLog += (val === 0 ? "\n✓ finished\n"
                                          : "\n✗ failed (exit " + val + ")\n");
                 root.refreshAll();
+                if (root.opOnDone) {
+                    var cb = root.opOnDone;
+                    root.opOnDone = null;
+                    cb(val);
+                }
             }
         }
     }
@@ -148,6 +155,13 @@ MainView {
                         width: parent.width
                         height: units.dp(1)
                         color: theme.palette.normal.base
+                    }
+                    Button {
+                        width: parent.width
+                        text: i18n.tr("Chum store")
+                        color: theme.palette.normal.positive
+                        enabled: root.rootfsReady
+                        onClicked: stack.push(chumPage)
                     }
                     Button {
                         width: parent.width
@@ -317,6 +331,95 @@ MainView {
                     visible: ap.apps.length === 0
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: i18n.tr("No apps installed yet")
+                    color: theme.palette.normal.backgroundSecondaryText
+                }
+            }
+        }
+    }
+
+    // ======================================================= CHUM STORE
+    Component {
+        id: chumPage
+        Page {
+            id: cp
+            property var allApps: []     // full catalog
+            property var apps: []        // filtered view shown in the list
+            property string filter: ""
+            property bool loading: false
+
+            function applyFilter() {
+                if (cp.filter.length === 0) { cp.apps = cp.allApps; return; }
+                var f = cp.filter.toLowerCase(), r = [];
+                for (var i = 0; i < cp.allApps.length; i++) {
+                    var a = cp.allApps[i];
+                    if (a.name.toLowerCase().indexOf(f) >= 0 ||
+                        a.summary.toLowerCase().indexOf(f) >= 0) r.push(a);
+                }
+                cp.apps = r;
+            }
+            function reload() {
+                cp.loading = true;
+                py.call("backend.chum_list", [], function (l) {
+                    cp.allApps = l; cp.loading = false; cp.applyFilter();
+                });
+            }
+            Component.onCompleted: reload()
+
+            header: PageHeader {
+                id: hChum
+                title: i18n.tr("Chum store")
+                subtitle: cp.allApps.length > 0 ? cp.apps.length + " / " + cp.allApps.length : ""
+                trailingActionBar.actions: Action {
+                    iconName: "reload"
+                    text: i18n.tr("Refresh catalog")
+                    onTriggered: root.startOp(i18n.tr("Enable / refresh Chum"),
+                        function () { py.call("backend.chum_enable", [], function () {}); },
+                        function (rc) { if (rc === 0) cp.reload(); })
+                }
+            }
+            Column {
+                anchors { fill: parent; topMargin: hChum.height }
+                spacing: units.gu(1)
+                TextField {
+                    id: searchField
+                    width: parent.width - units.gu(2)
+                    x: units.gu(1)
+                    placeholderText: i18n.tr("Search %1 packages").arg(cp.allApps.length)
+                    inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+                    onDisplayTextChanged: { cp.filter = displayText; cp.applyFilter(); }
+                }
+                ListView {
+                    width: parent.width
+                    height: cp.height - hChum.height - searchField.height - units.gu(3)
+                    clip: true
+                    model: cp.apps
+                    delegate: ListItem {
+                        height: cl.height + units.gu(2)
+                        ListItemLayout {
+                            id: cl
+                            title.text: modelData.name
+                            subtitle.text: modelData.summary
+                            subtitle.maximumLineCount: 2
+                            subtitle.wrapMode: Text.WordWrap
+                            Button {
+                                SlotsLayout.position: SlotsLayout.Trailing
+                                text: modelData.installed ? i18n.tr("Installed") : i18n.tr("Install")
+                                enabled: !modelData.installed
+                                color: modelData.installed ? theme.palette.normal.base
+                                                           : theme.palette.normal.positive
+                                onClicked: root.startOp(i18n.tr("Install ") + modelData.name,
+                                    function () { py.call("backend.install_pkg", [modelData.name], function () {}); },
+                                    function (rc) { if (rc === 0) cp.reload(); })
+                            }
+                        }
+                    }
+                }
+                Label {
+                    visible: !cp.loading && cp.allApps.length === 0
+                    width: parent.width - units.gu(4)
+                    x: units.gu(2)
+                    wrapMode: Text.WordWrap
+                    text: i18n.tr("Tap the refresh icon to enable the Chum catalog.")
                     color: theme.palette.normal.backgroundSecondaryText
                 }
             }

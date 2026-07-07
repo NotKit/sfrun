@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -780,6 +781,109 @@ def cmd_install_rpm(args) -> int:
     return 0
 
 
+# ---- SailfishOS:Chum community repo ------------------------------------------
+# Chum is an OBS repo built per SFOS release. We resolve the newest release at or
+# below the rootfs version, add it with zypper (fully-resolved URL, no ssu needed),
+# and browse it via `zypper --xmlout se`. Installs go through the normal manage
+# sandbox — no PackageKit/ssu daemon required (see the design notes in memory).
+CHUM_OBS_BASE = os.environ.get(
+    "SFRUN_CHUM_URL", "https://repo.sailfishos.org/obs/sailfishos:/chum/")
+CHUM_ALIAS = "chum"
+# package name suffixes that are not user-facing apps (hidden from the catalog)
+CHUM_SKIP_SUFFIXES = ("-debuginfo", "-debugsource", "-devel", "-doc", "-tests")
+
+
+def rootfs_version() -> str:
+    osr = ROOTFS / "etc/os-release"
+    if osr.is_file():
+        for line in osr.read_text().splitlines():
+            if line.startswith("VERSION_ID="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
+def _ver_key(v: str):
+    return tuple(int(x) for x in v.split(".") if x.isdigit())
+
+
+def resolve_chum_release(arch: str) -> str:
+    """Newest chum OBS release at or below the rootfs SFOS version."""
+    import urllib.request as rq
+    try:
+        with rq.urlopen(CHUM_OBS_BASE, timeout=30) as r:
+            listing = r.read().decode(errors="replace")
+    except Exception as e:
+        die(f"cannot list chum releases at {CHUM_OBS_BASE}: {e}")
+    rels = sorted(set(re.findall(
+        r"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)_" + re.escape(arch), listing)),
+        key=_ver_key)
+    if not rels:
+        die(f"no chum releases found for arch {arch}")
+    target = rootfs_version()
+    if target:
+        usable = [v for v in rels if _ver_key(v) <= _ver_key(target)]
+        if usable:
+            return usable[-1]
+    return rels[-1]
+
+
+def cmd_chum(args) -> int:
+    """Manage the SailfishOS:Chum community repo: enable/disable it, or list its
+    catalog (`id<TAB>summary<TAB>installed(0|1)` per line, for the GUI)."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap` first")
+
+    if args.chum_cmd == "disable":
+        r = subprocess.run(manage_argv(["zypper", "--non-interactive", "rr", CHUM_ALIAS]))
+        return 0 if r.returncode in (0, 4) else 1
+
+    if args.chum_cmd == "enable":
+        rel = args.release or resolve_chum_release(args.arch)
+        url = f"{CHUM_OBS_BASE}{rel}_{args.arch}/"
+        print(f"chum release {rel}\n  {url}")
+        shell = (
+            f"zypper --non-interactive rr {CHUM_ALIAS} 2>/dev/null; "
+            f"zypper --non-interactive --no-gpg-checks ar -f -G '{url}' {CHUM_ALIAS} && "
+            f"zypper --non-interactive --no-gpg-checks ref {CHUM_ALIAS}")
+        if subprocess.run(manage_argv(["sh", "-c", shell])).returncode != 0:
+            die("failed to add/refresh chum repo")
+        print("chum enabled.")
+        return 0
+
+    if args.chum_cmd == "list":
+        import html
+        out = subprocess.run(
+            manage_argv(["zypper", "--non-interactive", "--no-refresh", "--xmlout",
+                         "se", "-r", CHUM_ALIAS, "-t", "package"]),
+            capture_output=True, text=True).stdout
+        for attrs in re.findall(r"<solvable\b([^>]*)/>", out):
+            m = re.search(r'name="([^"]*)"', attrs)
+            if not m or m.group(1).endswith(CHUM_SKIP_SUFFIXES):
+                continue
+            sm = re.search(r'summary="([^"]*)"', attrs)
+            st = re.search(r'status="([^"]*)"', attrs)
+            summary = html.unescape(sm.group(1)) if sm else ""
+            installed = 1 if (st and st.group(1) == "installed") else 0
+            print(f"{m.group(1)}\t{summary}\t{installed}")
+        return 0
+
+    die(f"unknown chum subcommand: {args.chum_cmd}")
+
+
+def cmd_install_pkg(args) -> int:
+    """Install a named package from the configured repos (resolves deps). Used for
+    Chum installs; also works for any package in an enabled repo."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap` first")
+    print(f"installing {args.pkg}")
+    r = subprocess.run(manage_argv(
+        ["zypper", "--non-interactive", "--no-gpg-checks", "in", args.pkg]))
+    if r.returncode not in (0, 4):
+        die(f"zypper install failed (exit {r.returncode})")
+    print("done.")
+    return 0
+
+
 # App-id prefixes for third-party (Jolla Store / Chum / OpenRepos) apps — what a
 # user actually installs, as opposed to the SDK rootfs's own system entries.
 APP_PREFIXES = ("harbour-", "openrepos-")
@@ -903,6 +1007,17 @@ def main(argv: list[str]) -> int:
     ir = sub.add_parser("install-rpm", help="install a local .rpm into the rootfs (deps from repos)")
     ir.add_argument("rpm", help="path to a .rpm file")
     ir.set_defaults(fn=cmd_install_rpm)
+
+    ch = sub.add_parser("chum", help="manage the SailfishOS:Chum community repo")
+    ch.add_argument("chum_cmd", choices=["enable", "disable", "list"],
+                    help="enable/refresh, disable, or list the chum catalog")
+    ch.add_argument("--release", help="chum release (default: newest <= rootfs version)")
+    ch.add_argument("--arch", default=TARGET_ARCH, help=f"repo arch (default: {TARGET_ARCH})")
+    ch.set_defaults(fn=cmd_chum)
+
+    ipk = sub.add_parser("install-pkg", help="install a named package from configured repos")
+    ipk.add_argument("pkg", help="package name (e.g. a chum app)")
+    ipk.set_defaults(fn=cmd_install_pkg)
 
     sub.add_parser("list-apps", help="list installed third-party apps (id/name/launcher, TAB-separated)").set_defaults(fn=cmd_list_apps)
 

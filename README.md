@@ -88,6 +88,28 @@ to e.g. `/opt/clickable` while data stays in the user's home.
 Cross-compiling the test client (on an x86_64 dev host with
 `aarch64-linux-gnu-gcc`): see the build line in `spike/SPIKE1-FINDINGS.md`.
 
+## Installing apps
+
+From the **SailfishOS:Chum** community repo (an OBS zypper repo, no PackageKit/ssu
+daemon needed — `sfrun` resolves the newest chum release at or below the rootfs
+version, adds it, and browses it with `zypper --xmlout se`):
+
+```sh
+python3 sfrun chum enable            # add + refresh the chum repo (auto release)
+python3 sfrun chum list              # id<TAB>summary<TAB>installed, one per line
+python3 sfrun install-pkg harbour-aenigma   # install a chum app (deps resolved)
+```
+
+Or from a local `.rpm` (deps still come from the repos):
+
+```sh
+python3 sfrun install-rpm ~/Downloads/harbour-foo.rpm
+```
+
+The QML control panel ("Sailfish Apps" in the drawer) wraps all of this — a
+searchable Chum store, RPM install, and a "My apps" list — see *Control panel*
+below.
+
 ## Running apps
 
 ```sh
@@ -139,9 +161,15 @@ hooks from `click/`. It installs under
 `/opt/click.ubuntu.com/sfrun.thekit/<version>/`; `sfrun` detects that
 location and keeps all data in `~/.local/share/sfrun.thekit/`.
 `make-desktop` launchers point at the package's `current` symlink, so they
-survive upgrades. The desktop hook is `NoDisplay` — setup stays CLI-driven
-(`bootstrap`/`prepare-gl`/`prepare-rootfs`/`make-desktop` from a terminal), and
-apps get their own drawer entries via `make-desktop`.
+survive upgrades.
+
+### Control panel
+
+The click's desktop entry launches a Lomiri/PyOtherSide QML app (`ui/Main.qml`
++ `ui/backend.py`) that drives `sfrun` as a subprocess: a status/`doctor` card,
+one-tap **Bootstrap** (with download progress) and **Setup**, a searchable
+**Chum store**, **Install from .rpm**, and a **My apps** list (run + add-to-drawer).
+Everything it does is a plain `sfrun` subcommand, so the CLI and GUI stay in sync.
 
 ## Next steps (per the plan)
 
@@ -160,4 +188,5 @@ apps get their own drawer entries via `make-desktop`.
 `SFRUN_BASE` (project base), `SFRUN_ROOTFS`, `SFRUN_HOSTGL`, `SFRUN_GLVND`,
 `SFRUN_DATA`, `SFRUN_SHIM`, `SFRUN_HOST_TRIPLET` (host libhybris dir),
 `SFRUN_ANDROID_SDK` (else auto via `getprop`), `SFRUN_DEBUG`,
-`SFRUN_TARGETS_URL` (SDK target download base), `SFRUN_TARGET_ARCH`.
+`SFRUN_TARGETS_URL` (SDK target download base), `SFRUN_TARGET_ARCH`,
+`SFRUN_CHUM_URL` (SailfishOS:Chum OBS base).
