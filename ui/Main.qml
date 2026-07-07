@@ -1,5 +1,6 @@
 import QtQuick 2.7
 import Lomiri.Components 1.3
+import Lomiri.Components.Popups 1.3
 import io.thp.pyotherside 1.5
 
 MainView {
@@ -312,6 +313,12 @@ MainView {
                             subtitle.text: modelData.id
                             Button {
                                 SlotsLayout.position: SlotsLayout.Trailing
+                                iconName: "delete"
+                                onClicked: PopupUtils.open(removeDialog, null,
+                                    { "appId": modelData.id, "appName": modelData.name })
+                            }
+                            Button {
+                                SlotsLayout.position: SlotsLayout.Trailing
                                 text: i18n.tr("Run")
                                 color: theme.palette.normal.positive
                                 onClicked: py.call("backend.run_app", [modelData.id], function () {})
@@ -332,6 +339,30 @@ MainView {
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: i18n.tr("No apps installed yet")
                     color: theme.palette.normal.backgroundSecondaryText
+                }
+            }
+            Component {
+                id: removeDialog
+                Dialog {
+                    id: dlg
+                    property string appId
+                    property string appName
+                    title: i18n.tr("Remove app")
+                    text: i18n.tr("Uninstall %1 and remove its launcher?").arg(appName)
+                    Button {
+                        text: i18n.tr("Remove")
+                        color: theme.palette.normal.negative
+                        onClicked: {
+                            PopupUtils.close(dlg);
+                            root.startOp(i18n.tr("Remove ") + dlg.appName,
+                                function () { py.call("backend.remove_app", [dlg.appId], function () {}); },
+                                function (rc) { if (rc === 0) ap.refresh(); });
+                        }
+                    }
+                    Button {
+                        text: i18n.tr("Cancel")
+                        onClicked: PopupUtils.close(dlg)
+                    }
                 }
             }
         }

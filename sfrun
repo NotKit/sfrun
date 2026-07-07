@@ -188,6 +188,8 @@ def guest_env(app_data: Path) -> dict[str, str]:
     env = {
         "HOME": GUEST_HOME,
         "USER": DEV_USER,
+        # so bare Exec commands from a .desktop (e.g. `sailfish-qml <app>`) resolve.
+        "PATH": "/usr/bin:/bin",
         "XDG_RUNTIME_DIR": xdg,
         "WAYLAND_DISPLAY": wl,
         # talk straight to Lomiri over wl_shell. Do NOT set
@@ -577,9 +579,50 @@ def cmd_patch_silica(_args) -> int:
     return 0
 
 
+# .desktop Exec field codes to drop (freedesktop spec) — none apply under sfrun.
+DESKTOP_FIELD_CODES = {"%U", "%u", "%f", "%F", "%i", "%c", "%k",
+                       "%d", "%D", "%n", "%N", "%v", "%m"}
+
+
+def app_exec(appid: str) -> list[str] | None:
+    """The launch command for an installed app, taken from its .desktop `Exec`
+    (field codes dropped, any `invoker` wrapper stripped, a bare command resolved
+    to /usr/bin). None if the app has no .desktop. Handles both compiled apps
+    (`Exec=harbour-foo`) and QML-only apps (`Exec=sailfish-qml harbour-foo`)."""
+    import shlex
+    desk = ROOTFS / "usr/share/applications" / f"{appid}.desktop"
+    if not desk.is_file():
+        return None
+    exec_line = None
+    for line in desk.read_text(errors="replace").splitlines():
+        if line.startswith("Exec="):
+            exec_line = line[5:].strip()
+            break
+    if not exec_line:
+        return None
+    try:
+        toks = [t for t in shlex.split(exec_line) if t not in DESKTOP_FIELD_CODES]
+    except ValueError:
+        toks = [t for t in exec_line.split() if t not in DESKTOP_FIELD_CODES]
+    # strip a booster/invoker wrapper: `invoker [--opts] [-s] REALCMD ...`
+    if toks and (toks[0] == "invoker" or toks[0].endswith("/invoker")):
+        i = 1
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 1
+        toks = toks[i:]
+    # resolve a bare command name against the rootfs's /usr/bin
+    if toks and "/" not in toks[0] and (ROOTFS / "usr/bin" / toks[0]).is_file():
+        toks[0] = f"/usr/bin/{toks[0]}"
+    return toks or None
+
+
 def cmd_run(args) -> int:
     app = args.app
-    inner = ([app] if app.startswith("/") else [f"/usr/bin/{app}"]) + args.app_args
+    if app.startswith("/"):
+        inner = [app]
+    else:
+        inner = app_exec(app) or [f"/usr/bin/{app}"]  # fall back to a bare binary
+    inner += args.app_args
     argv = build_bwrap_argv(inner)
     if os.environ.get("SFRUN_DEBUG"):
         print("+ " + " ".join(argv), file=sys.stderr)
@@ -1030,6 +1073,46 @@ def cmd_make_desktop(args) -> int:
     return 0
 
 
+def cmd_remove_app(args) -> int:
+    """Uninstall an app: remove the owning package from the rootfs and delete its
+    host launcher + copied icons."""
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap` first")
+    appid = args.app
+    desk = ROOTFS / "usr/share/applications" / f"{appid}.desktop"
+
+    # read the icon name (and find the owning package) while the app is still
+    # installed — both are gone after removal.
+    icon_name, pkg = appid, None
+    if desk.is_file():
+        for line in desk.read_text(errors="replace").splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == "Icon":
+                icon_name = v.strip()
+        out = subprocess.run(
+            manage_argv(["rpm", "-qf", "--queryformat", "%{NAME}",
+                         f"/usr/share/applications/{appid}.desktop"]),
+            capture_output=True, text=True).stdout.strip()
+        if out and " " not in out and "not owned" not in out:
+            pkg = out
+
+    target = pkg or appid
+    print(f"removing {target}")
+    r = subprocess.run(manage_argv(["zypper", "--non-interactive", "rm", target]))
+    if r.returncode not in (0, 4):
+        die(f"zypper remove failed (exit {r.returncode})")
+
+    removed_icons = 0
+    (HOST_APPS / f"sfrun-{appid}.desktop").unlink(missing_ok=True)
+    if icon_name and not icon_name.startswith("/"):
+        for p in HOST_ICONS.glob(f"*/apps/{icon_name}.*"):
+            p.unlink(missing_ok=True)
+            removed_icons += 1
+    print(f"removed launcher + {removed_icons} icons")
+    print("done.")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # helpers / CLI
 # --------------------------------------------------------------------------
@@ -1091,6 +1174,10 @@ def main(argv: list[str]) -> int:
     md = sub.add_parser("make-desktop", help="generate a host .desktop launcher for an installed app")
     md.add_argument("app", help="app id (matches /usr/share/applications/<id>.desktop in the target)")
     md.set_defaults(fn=cmd_make_desktop)
+
+    rm = sub.add_parser("remove", help="uninstall an app and remove its launcher")
+    rm.add_argument("app", help="app id")
+    rm.set_defaults(fn=cmd_remove_app)
 
     ss = sub.add_parser("set-scale", help="set Silica theme pixel ratio in user dconf")
     ss.add_argument("ratio", nargs="?", type=float,

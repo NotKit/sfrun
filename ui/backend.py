@@ -76,6 +76,10 @@ def make_desktop(appid):
     _run_op("desktop", ["make-desktop", appid])
 
 
+def remove_app(appid):
+    _run_op("remove", ["remove", appid])
+
+
 # --- fire-and-forget ---
 
 def run_app(appid):

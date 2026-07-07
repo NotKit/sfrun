@@ -106,6 +106,13 @@ Or from a local `.rpm` (deps still come from the repos):
 python3 sfrun install-rpm ~/Downloads/harbour-foo.rpm
 ```
 
+Installing an app auto-creates its host launcher (drawer entry). To uninstall an
+app and remove its launcher + icons:
+
+```sh
+python3 sfrun remove harbour-foo
+```
+
 The QML control panel ("Sailfish Apps" in the drawer) wraps all of this — a
 searchable Chum store, RPM install, and a "My apps" list — see *Control panel*
 below.
@@ -113,10 +120,16 @@ below.
 ## Running apps
 
 ```sh
-python3 sfrun run harbour-someapp            # runs /usr/bin/harbour-someapp
+python3 sfrun run harbour-someapp            # launches per the app's .desktop Exec
 python3 sfrun run /usr/bin/harbour-someapp   # absolute path also works
 SFRUN_DEBUG=1 python3 sfrun run ...          # print the bwrap argv
 ```
+
+`run <id>` honors the app's `.desktop` `Exec`, so both compiled apps
+(`Exec=harbour-foo`) and QML-only apps (`Exec=sailfish-qml harbour-foo`) work; an
+`invoker` booster prefix is stripped. Apps that import QML modules missing from
+the rootfs (e.g. `Sailfish.WebView`/`WebEngine`, which need the embedded Gecko
+engine) load to a blank window — that's a missing dependency, not a render bug.
 
 Build the shim (optional until Spike 2): `make -C shim`
 (cross: `make -C shim CC=aarch64-linux-gnu-gcc`).
