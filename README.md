@@ -4,10 +4,18 @@ Run unmodified **Harbour-compliant** SailfishOS/AuroraOS apps on Ubuntu Touch
 (Lomiri/Mir), with minimal overhead.
 
 A Sailfish SDK target rootfs is mounted as the guest userspace inside an
-unprivileged **bubblewrap** mount namespace; the host **libhybris** GL stack +
-Android HAL are bound in; and the guest Qt 5.6 app talks **directly** to Lomiri's
-compositor over **`wl_shell`**. A small `LD_PRELOAD` shim fills the gaps Lipstick
-would otherwise provide (ambience background, orientation, missing globals).
+unprivileged **bubblewrap** mount namespace; **non-glvnd SFOS libhybris** is
+installed *into that rootfs* (the native Sailfish/Halium way) and loads the
+device's own `/vendor` Android GL blobs; and the guest Qt 5.6 app talks
+**directly** to Lomiri's compositor over **`wl_shell`**. A small `LD_PRELOAD`
+shim fills the gaps Lipstick would otherwise provide (ambience background,
+orientation, missing globals).
+
+We deliberately do **not** bind UT's host GL libs: UT ships libhybris only as a
+glvnd vendor, and glvnd's per-thread dispatch returns a null `glGetString` on
+threads it doesn't track (Gecko's compositor thread), which crashes
+hardware-accelerated web content. Non-glvnd libhybris exports the real EGL API
+and fixes that (WebView apps and the browser render on the GPU).
 
 - No container daemon (no LXC/podman/docker) — just `bwrap`.
 - No nested compositor and no protocol-translating proxy.
@@ -31,7 +39,7 @@ launcher's bind/env set.
 
 Everything runs under a writable base dir (the UT rootfs is read-only): code
 (`sfrun`, `shim/`) is located relative to the script itself and may live on a
-read-only fs; data (`rootfs/`, `home/`, `hostgl/`, `glvnd/`) resolves to
+read-only fs; data (`rootfs/`, `home/`, `cache/`) resolves to
 `$XDG_DATA_HOME/<click package name>` (`~/.local/share/sfrun.thekit`)
 when installed as a click, or to the script dir when it already holds a
 `rootfs/` (dev layout), or to `~/.local/share/sfrun` otherwise. Override with
@@ -48,8 +56,9 @@ Inside a Lomiri session, on the device:
 #    local .tar/.tar.7z, or a dir. .tar.7z needs 7zz/7z on PATH.
 python3 sfrun bootstrap
 
-# 2. Build the curated host-GL stack (real copies of host libhybris GL libs,
-#    eglplatform plugins, android linker shims, glvnd vendor JSON). Run once.
+# 2. Install the non-glvnd libhybris GL stack into the rootfs (from the SFOS
+#    Halium HW-adaptation repo; force-swaps out the SDK target's mesa-llvmpipe
+#    software GL). Run once.
 python3 sfrun prepare-gl
 
 # 3. Patch Silica for Lomiri (disable Lipstick cover window; paint a blurred
@@ -77,10 +86,11 @@ python3 sfrun set-scale 1.5                # Silica pixel ratio (user dconf)
 python3 sfrun make-desktop harbour-fernschreiber   # -> UT app drawer entry
 ```
 
-Code (script, `shim/`, `spike/`) and data (`rootfs/`, `home/`, `hostgl/`,
-`glvnd/` under `SFRUN_BASE`) are decoupled: `SFRUN_BASE` defaults to the script
-dir if it holds a `rootfs/`, else `$XDG_DATA_HOME/sfrun` — so the script can move
-to e.g. `/opt/clickable` while data stays in the user's home.
+Code (script, `shim/`, `spike/`) and data (`rootfs/`, `home/`, `cache/` under
+`SFRUN_BASE`) are decoupled: `SFRUN_BASE` defaults to the script dir if it holds
+a `rootfs/`, else `$XDG_DATA_HOME/sfrun` — so the script can move to e.g.
+`/opt/clickable` while data stays in the user's home. The GL stack lives inside
+the rootfs itself (no separate `hostgl/`).
 
 **Pass:** a colour-cycling window appears and the log shows
 `GLES renderer=<your GPU>` / `OK - full path works`.
@@ -198,8 +208,9 @@ Everything it does is a plain `sfrun` subcommand, so the CLI and GUI stay in syn
 
 ## Env knobs
 
-`SFRUN_BASE` (project base), `SFRUN_ROOTFS`, `SFRUN_HOSTGL`, `SFRUN_GLVND`,
-`SFRUN_DATA`, `SFRUN_SHIM`, `SFRUN_HOST_TRIPLET` (host libhybris dir),
+`SFRUN_BASE` (project base), `SFRUN_ROOTFS`, `SFRUN_HOME`, `SFRUN_SHIM`,
 `SFRUN_ANDROID_SDK` (else auto via `getprop`), `SFRUN_DEBUG`,
 `SFRUN_TARGETS_URL` (SDK target download base), `SFRUN_TARGET_ARCH`,
+`SFRUN_LIBDIR` (guest libdir; default `lib64` for aarch64, `lib` for armhf),
+`SFRUN_HALIUM_URL` (libhybris HW-adaptation OBS base),
 `SFRUN_CHUM_URL` (SailfishOS:Chum OBS base).

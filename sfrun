@@ -6,13 +6,14 @@ unprivileged bubblewrap mount namespace; the host libhybris GL stack + Android
 HAL are bound in; and the guest talks *directly* to Lomiri's Wayland compositor
 over wl_shell. No container daemon, no nested compositor, no protocol proxy.
 
-The bind/env recipe here is the one validated by Spike 1 on a MediaTek/Mali
-UT 24.04 device (see spike/SPIKE1-FINDINGS.md). The key libhybris-on-UT pieces:
+The GL stack is non-glvnd SFOS libhybris installed *into the rootfs* (like a real
+Sailfish/Halium port); it loads the device's own /vendor Android blobs. The key
+libhybris pieces (validated on a MediaTek/Mali UT 24.04 device):
   - explicit Wayland EGL platform (eglGetPlatformDisplayEXT), EGL_PLATFORM=wayland
   - HYBRIS_LD_LIBRARY_PATH  : Android linker search path (VNDK/HAL libs)
-  - HYBRIS_LINKER_DIR       : override hardcoded /usr/lib/.../libhybris/linker
-  - HYBRIS_EGLPLATFORM_DIR  : where eglplatform_wayland.so lives
-  - __EGL_VENDOR_LIBRARY_DIRS: host glvnd vendor JSON (guest /usr has none)
+  - HYBRIS_LINKER_DIR       : the libhybris android linker shims in the rootfs
+  - HYBRIS_EGLPLATFORM_DIR  : where eglplatform_wayland.so lives (rootfs)
+  - libtls-padding preload  : reserve bionic TLS (else threaded GL crashes)
   - bind /dev/__properties__ + /android (with /apex,/linkerconfig symlinks)
   - DESKTOP_FILE_HINT=lomiri : satisfy Lomiri's Wayland confinement
 
@@ -20,7 +21,7 @@ Subcommands:
   doctor              Preflight checks.
   bootstrap [src]     Populate the guest rootfs from an SDK target tarball/dir
                       (no arg: download the latest target from Jolla).
-  prepare-gl          Build the curated host-GL stack (run once, on-device).
+  prepare-gl          Install the non-glvnd libhybris GL stack into the rootfs.
   run <app> [args]    Launch an installed app id (or absolute binary path).
   spike               Run the bundled wl_shell+EGL test client (Spike 1).
 """
@@ -43,7 +44,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 # CODE lives with the script (HERE: sfrun + shim/ + spike/), DATA lives under BASE
-# (rootfs/, home/, hostgl/, glvnd/). They are decoupled so the script can be
+# (rootfs/, home/, cache/). They are decoupled so the script can be
 # installed somewhere fixed and read-only (a click package under
 # /opt/click.ubuntu.com/<pkg>/<version>/) while data sits in the user's XDG dir.
 # Resolution order for BASE: $SFRUN_BASE, else the script dir if it already
@@ -93,8 +94,6 @@ def _default_base() -> Path:
 
 BASE = Path(os.environ["SFRUN_BASE"]) if os.environ.get("SFRUN_BASE") else _default_base()
 ROOTFS = Path(os.environ.get("SFRUN_ROOTFS", str(BASE / "rootfs")))
-HOSTGL = Path(os.environ.get("SFRUN_HOSTGL", str(BASE / "hostgl")))
-GLVND = Path(os.environ.get("SFRUN_GLVND", str(BASE / "glvnd")))
 # Single shared guest home, like a real Sailfish device (apps separate their data
 # by ~/.local/share/<App>). Runs as the device user (Sailfish allows any login
 # name), so the uid resolves in passwd (needed by dbus/dconf).
@@ -107,9 +106,24 @@ HOME_DIR = Path(os.environ.get("SFRUN_HOME", str(BASE / "home")))
 SHIM = Path(os.environ.get("SFRUN_SHIM", str(HERE / "shim" / "libsailfish-shim.so")))
 SHIM_GUEST = "/sfcode/shim/libsailfish-shim.so"
 
-# Host libhybris install dir (multiarch triplet on UT).
-HOST_TRIPLET = Path(os.environ.get("SFRUN_HOST_TRIPLET", "/usr/lib/aarch64-linux-gnu"))
-HOST_GLVND_VENDOR = Path("/usr/share/glvnd/egl_vendor.d")
+# Target arch of the guest rootfs, and the libdir it implies: 64-bit SFOS uses
+# /usr/lib64 and the device's 64-bit Android blobs (/system/lib64); 32-bit SFOS
+# (armv7hl) uses /usr/lib and the 32-bit blobs (/system/lib).
+TARGET_ARCH = os.environ.get("SFRUN_TARGET_ARCH", "aarch64")
+LIBDIR = os.environ.get("SFRUN_LIBDIR") or (
+    "lib64" if TARGET_ARCH in ("aarch64", "x86_64") else "lib")
+USR_LIB = f"/usr/{LIBDIR}"
+
+# GL stack. We use non-glvnd SFOS libhybris installed into the rootfs (the native
+# Sailfish/Halium approach) rather than binding the host's UT GL libs: UT ships
+# libhybris only as a glvnd vendor, and glvnd's per-thread dispatch returns a
+# null glGetString on threads it doesn't track (e.g. Gecko's compositor thread),
+# which crashes hardware-accelerated web content. Flat libhybris exports the real
+# EGL API and loads the device's own /vendor Android blobs directly. These paths
+# are where the libhybris packages install inside the rootfs.
+HYBRIS_LIBDIR = f"{USR_LIB}/libhybris"          # eglplatform_wayland.so lives here
+HYBRIS_LINKER = f"{USR_LIB}/libhybris/linker"   # android linker shims (q.so, ...)
+TLS_PADDING = f"{USR_LIB}/libtls-padding.so"    # bionic-TLS reservation preload
 
 # Android runtime knobs. SDK version drives the VNDK apex path.
 ANDROID_SDK = os.environ.get("SFRUN_ANDROID_SDK", "")  # autodetected if empty
@@ -118,7 +132,26 @@ ANDROID_SDK = os.environ.get("SFRUN_ANDROID_SDK", "")  # autodetected if empty
 # Jolla to the user's device — we never redistribute the rootfs ourselves).
 SDK_TARGETS_URL = os.environ.get(
     "SFRUN_TARGETS_URL", "https://releases.sailfishos.org/sdk/targets/")
-TARGET_ARCH = os.environ.get("SFRUN_TARGET_ARCH", "aarch64")
+
+# Flat SFOS/Halium libhybris GL stack: a community HW-adaptation repo that builds
+# libhybris against recent Android headers (backward-compatible with older HALs).
+HALIUM_REPO = os.environ.get(
+    "SFRUN_HALIUM_URL",
+    "https://repo.sailfishos.org/obs/nemo:/testing:/hw:/halium:/13:/5.1/"
+    f"sailfishos_5.1_{TARGET_ARCH}/")
+HALIUM_ALIAS = "halium"
+# The non-glvnd libhybris GL packages + the TLS-padding preload.
+HYBRIS_PACKAGES = [
+    "libhybris", "libhybris-libEGL", "libhybris-libGLESv2",
+    "libhybris-libhardware", "libhybris-libsync", "libhybris-libwayland-egl",
+    "libtls-padding",
+]
+# The SDK target ships mesa-llvmpipe (software GL); its libEGL/libGLESv2 conflict
+# with non-glvnd libhybris and must be force-removed first (a device has no mesa).
+MESA_GL_CONFLICTS = [
+    "mesa-llvmpipe-libEGL", "mesa-llvmpipe-libGLESv2",
+    "mesa-llvmpipe-libEGL-devel", "mesa-llvmpipe-libGLESv2-devel",
+]
 
 
 # --------------------------------------------------------------------------
@@ -140,20 +173,6 @@ DEV_NODES = [
 PROVIDED = {"dev", "proc", "tmp", "run", "sys",
             "system", "vendor", "odm", "android", "apex", "linkerconfig", "home"}
 
-# Host GL/hybris libs to copy into the curated HOSTGL dir (prepare-gl). Real
-# copies, not symlinks (symlinks would dangle inside the namespace). Core glibc
-# libs are deliberately excluded so the guest's newer glibc stays in use.
-GL_LIB_PATTERNS = [
-    "libEGL*", "libGLES*", "libGL.so*", "libGLdispatch*", "libOpenGL*",
-    "libGLX*", "libglvnd*", "libgbm*", "libdrm*", "libwayland-egl*",
-    "libhybris*", "libhardware*", "libsync*", "libglapi*", "libexpat*",
-    "libgralloc*", "libui*", "libcutils*", "libutils*",
-    # bionic-TLS reservation shim: libhybris GL stores the EGL context in a
-    # bionic TLS slot that clobbers glibc TLS across threads without this.
-    # UT preloads it into every hybris Qt app.
-    "libtls-padding*",
-]
-
 
 def android_sdk() -> str:
     if ANDROID_SDK:
@@ -171,10 +190,11 @@ def android_sdk() -> str:
 
 def hybris_ld_library_path() -> str:
     sdk = android_sdk()
+    lib = LIBDIR  # device Android blobs: 64-bit guest -> lib64, 32-bit -> lib
     return ":".join([
-        "/system/lib64",
-        f"/apex/com.android.vndk.v{sdk}/lib64",
-        "/vendor/lib64/hw", "/vendor/lib64/egl", "/vendor/lib64",
+        f"/system/{lib}",
+        f"/apex/com.android.vndk.v{sdk}/{lib}",
+        f"/vendor/{lib}/hw", f"/vendor/{lib}/egl", f"/vendor/{lib}",
     ])
 
 
@@ -208,26 +228,27 @@ def guest_env(app_data: Path) -> dict[str, str]:
         # threaded scene-graph render loop aborts ("makeCurrent in a different
         # thread"). Force the single-threaded render loop.
         "QSG_RENDER_LOOP": "basic",
-        # --- the validated libhybris-on-UT EGL recipe ---
+        # --- non-glvnd SFOS libhybris EGL recipe (GL libs live in the rootfs) ---
+        # non-glvnd libhybris exports the real EGL API directly. It loads the
+        # device's Android GL blobs from /vendor via HYBRIS_LD_LIBRARY_PATH.
         "EGL_PLATFORM": "wayland",
         "HYBRIS_EGLPLATFORM": "wayland",
-        "HYBRIS_EGLPLATFORM_DIR": "/hostgl",
-        "HYBRIS_LINKER_DIR": "/hostgl/linker",
+        "HYBRIS_EGLPLATFORM_DIR": HYBRIS_LIBDIR,
+        "HYBRIS_LINKER_DIR": HYBRIS_LINKER,
         "HYBRIS_ANDROID_SDK_VERSION": android_sdk(),
         "HYBRIS_LD_LIBRARY_PATH": hybris_ld_library_path(),
-        "__EGL_VENDOR_LIBRARY_DIRS": "/hostglvnd",
-        "LD_LIBRARY_PATH": "/hostgl:/usr/lib64:/lib64",
+        "LD_LIBRARY_PATH": f"{USR_LIB}:/{LIBDIR}",
         # Lomiri Wayland confinement needs a desktop hint to allow the connection.
         # When launched from a .desktop, Lomiri sets DESKTOP_FILE_HINT itself —
         # inherit that; only default to "lomiri" for a manual CLI launch.
         "DESKTOP_FILE_HINT": os.environ.get("DESKTOP_FILE_HINT", "lomiri"),
-        # Silica theme / QML lookup (guest libdir is /usr/lib64).
+        # Silica theme / QML lookup (guest libdir per target arch).
         "XDG_DATA_DIRS": "/usr/share",
-        "QML2_IMPORT_PATH": "/usr/lib64/qt5/qml",
-        "QT_PLUGIN_PATH": "/usr/lib64/qt5/plugins",
-        # tls-padding is mandatory for hybris GL; the compat shim is optional
-        # (referenced at its in-sandbox /sfcode path).
-        "LD_PRELOAD": ":".join(p for p in ("/hostgl/libtls-padding.so",
+        "QML2_IMPORT_PATH": f"{USR_LIB}/qt5/qml",
+        "QT_PLUGIN_PATH": f"{USR_LIB}/qt5/plugins",
+        # tls-padding is mandatory for hybris GL (bionic vs glibc TLS); the compat
+        # shim is optional (referenced at its in-sandbox /sfcode path).
+        "LD_PRELOAD": ":".join(p for p in (TLS_PADDING,
                                            SHIM_GUEST if SHIM.exists() else "") if p),
     }
     for k in ("LANG", "LC_ALL", "DBUS_SESSION_BUS_ADDRESS",
@@ -270,8 +291,8 @@ def ensure_user() -> None:
 def build_bwrap_argv(inner_argv: list[str]) -> list[str]:
     if not ROOTFS.is_dir():
         die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap <src>` first")
-    if not HOSTGL.is_dir() or not (HOSTGL / "linker").is_dir():
-        die(f"host-GL stack not built at {HOSTGL}; run `sfrun prepare-gl` first")
+    if not (ROOTFS / f"usr/{LIBDIR}/libhybris").is_dir():
+        die("non-glvnd libhybris GL stack not installed in the rootfs; run `sfrun prepare-gl` first")
     ensure_user()
 
     argv: list[str] = [
@@ -300,9 +321,8 @@ def build_bwrap_argv(inner_argv: list[str]) -> list[str]:
         argv += ["--symlink", "/android/apex", "/apex",
                  "--symlink", "/android/linkerconfig", "/linkerconfig"]
 
-    # curated host GL stack + host glvnd vendor JSON.
-    argv += ["--ro-bind", str(HOSTGL), "/hostgl"]
-    argv += ["--ro-bind", str(GLVND), "/hostglvnd"]
+    # No host GL binds: the non-glvnd libhybris GL stack lives in the rootfs
+    # ({USR_LIB}) and loads the device's Android blobs from the /vendor bind above.
 
     # GPU / IPC / property-store device nodes (only those present).
     for node in DEV_NODES:
@@ -366,9 +386,12 @@ def cmd_doctor(_args) -> int:
 
     check(f"guest rootfs at {ROOTFS}", ROOTFS.is_dir(),
           "run `sfrun bootstrap <sdk-target>`")
-    check(f"host-GL stack at {HOSTGL}", HOSTGL.is_dir() and (HOSTGL / "linker").is_dir(),
+    libegl = ROOTFS / f"usr/{LIBDIR}/libEGL.so.1"
+    check(f"non-glvnd libhybris GL in rootfs ({USR_LIB})",
+          libegl.exists() and (ROOTFS / f"usr/{LIBDIR}/libhybris").is_dir(),
           "run `sfrun prepare-gl`")
-    check(f"glvnd vendor JSON at {GLVND}", GLVND.is_dir() and any(GLVND.glob("*.json")),
+    check(f"tls-padding preload ({TLS_PADDING})",
+          (ROOTFS / TLS_PADDING.lstrip("/")).exists(),
           "run `sfrun prepare-gl`")
     check(f"compiled shim at {SHIM}", SHIM.exists(), "build it: make -C shim (optional)")
 
@@ -496,39 +519,46 @@ def cmd_bootstrap(args) -> int:
 
 
 def cmd_prepare_gl(_args) -> int:
-    """Build the curated host-GL stack: real copies of the host libhybris GL
-    libs (+ eglplatform plugins + android linker shims) and the glvnd vendor
-    JSON. Run once on the device; re-run after a host GL update."""
-    if not HOST_TRIPLET.is_dir():
-        die(f"host libhybris dir not found: {HOST_TRIPLET}")
+    """Install the non-glvnd SFOS/Halium libhybris GL stack into the rootfs — the
+    native-Sailfish approach: libhybris exports the real EGL API directly and
+    loads the device's own /vendor Android blobs. Replaces the SDK target's
+    mesa-llvmpipe software GL. Run once after bootstrap; idempotent.
 
-    if HOSTGL.exists():
-        shutil.rmtree(HOSTGL)
-    (HOSTGL / "linker").mkdir(parents=True)
-    GLVND.mkdir(parents=True, exist_ok=True)
+    Why not the host's UT GL libs: UT ships libhybris only as a glvnd vendor, and
+    glvnd's per-thread dispatch returns a NULL glGetString on threads it doesn't
+    track (Gecko's compositor thread), crashing hardware-accelerated web content.
+    """
+    if not ROOTFS.is_dir():
+        die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap` first")
 
-    n = 0
-    for pat in GL_LIB_PATTERNS:
-        for f in HOST_TRIPLET.glob(pat):
-            if f.is_file():
-                shutil.copy(f, HOSTGL / f.name)  # follows symlinks -> real file
-                n += 1
-    # libhybris eglplatform_*.so + hwcomposer plugins (flat; found via env dir).
-    plugdir = HOST_TRIPLET / "libhybris"
-    for f in plugdir.glob("*.so"):
-        shutil.copy(f, HOSTGL / f.name); n += 1
-    # android linker shims (q.so etc.)
-    for f in (plugdir / "linker").glob("*.so"):
-        shutil.copy(f, HOSTGL / "linker" / f.name); n += 1
-    # glvnd vendor JSON (points to libEGL_libhybris.so.0 via LD_LIBRARY_PATH).
-    for j in HOST_GLVND_VENDOR.glob("*libhybris*.json"):
-        shutil.copy(j, GLVND / j.name)
-    if not any(GLVND.glob("*.json")):
-        warn(f"no libhybris glvnd vendor JSON found in {HOST_GLVND_VENDOR}")
+    # 1. add + refresh the halium HW-adaptation repo (non-glvnd libhybris built
+    #    against recent Android headers, backward-compatible with older HALs).
+    print(f"adding halium repo\n  {HALIUM_REPO}")
+    add = (f"zypper --non-interactive rr {HALIUM_ALIAS} 2>/dev/null; "
+           f"zypper --non-interactive --no-gpg-checks ar -f -G '{HALIUM_REPO}' {HALIUM_ALIAS} && "
+           f"zypper --non-interactive --no-gpg-checks ref {HALIUM_ALIAS}")
+    if subprocess.run(manage_argv(["sh", "-c", add])).returncode != 0:
+        die("failed to add/refresh the halium repo")
 
-    print(f"copied {n} libs into {HOSTGL}")
-    print(f"linkers: {sorted(p.name for p in (HOSTGL / 'linker').glob('*.so'))}")
-    print(f"glvnd:   {sorted(p.name for p in GLVND.glob('*.json'))}")
+    # 2. force-remove the SDK target's mesa-llvmpipe GL — its libEGL/libGLESv2
+    #    conflict with non-glvnd libhybris (zypper won't swap them cleanly). Per
+    #    package so re-runs and absent packages are harmless.
+    print("removing mesa-llvmpipe software GL (if present)")
+    rm = "; ".join(f"rpm -e --nodeps {p} 2>/dev/null || true" for p in MESA_GL_CONFLICTS)
+    subprocess.run(manage_argv(["sh", "-c", rm]))
+
+    # 3. install the non-glvnd libhybris GL stack + the tls-padding preload.
+    print("installing non-glvnd libhybris GL stack:\n  " + "\n  ".join(HYBRIS_PACKAGES))
+    r = subprocess.run(manage_argv(
+        ["zypper", "--non-interactive", "--no-gpg-checks", "in"] + HYBRIS_PACKAGES))
+    if r.returncode not in (0, 4):
+        die(f"libhybris install failed (exit {r.returncode})")
+
+    # 4. verify libEGL and the eglplatform/linker dirs landed.
+    if not (ROOTFS / f"usr/{LIBDIR}/libEGL.so.1").exists() or \
+       not (ROOTFS / f"usr/{LIBDIR}/libhybris").is_dir():
+        die("libhybris GL libs not found in the rootfs after install")
+    print("done. non-glvnd libhybris installed. run `sfrun doctor`.")
     return 0
 
 
@@ -537,7 +567,7 @@ def cmd_prepare_gl(_args) -> int:
 # exists on Lomiri, so we patch the rootfs QML to (1) skip cover creation and
 # (2) paint a blurred in-window ambience. Idempotent (marker-guarded), keeps a
 # .orig backup. Re-run after a rootfs rebuild / Silica update.
-SILICA_AW = "usr/lib64/qt5/qml/Sailfish/Silica/ApplicationWindow.qml"
+SILICA_AW = f"usr/{LIBDIR}/qt5/qml/Sailfish/Silica/ApplicationWindow.qml"
 AMBIENCE_WALLPAPER = os.environ.get(
     "SFRUN_WALLPAPER",
     "/usr/share/themes/sailfish-default/silica/images/wallpaper.jpg")
@@ -779,7 +809,7 @@ def cmd_prepare_rootfs(args) -> int:
 
 
 def cmd_setup(args) -> int:
-    """Full bring-up after `bootstrap`: build the host-GL stack, install the
+    """Full bring-up after `bootstrap`: install the non-glvnd libhybris GL stack,
     runtime packages, patch Silica, and set the theme scale — in order. Each step
     is idempotent, so this is safe to re-run. Scale defaults to the GRID_UNIT_PX
     env (Lomiri sets it) snapped to a Silica zoom level."""
@@ -1142,7 +1172,7 @@ def main(argv: list[str]) -> int:
     b.add_argument("--force", action="store_true", help="overwrite a non-empty rootfs")
     b.set_defaults(fn=cmd_bootstrap)
 
-    sub.add_parser("prepare-gl", help="build curated host-GL stack").set_defaults(fn=cmd_prepare_gl)
+    sub.add_parser("prepare-gl", help="install the non-glvnd libhybris GL stack into the rootfs").set_defaults(fn=cmd_prepare_gl)
 
     pr = sub.add_parser("prepare-rootfs", help="install runtime packages (qmlscene, svg, theme graphics)")
     pr.add_argument("--scale", type=float, help="zoom level for graphics (default from GRID_UNIT_PX or 1.5)")
