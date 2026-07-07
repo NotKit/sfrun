@@ -1,113 +1,82 @@
 # sfrun
 
-Run unmodified **Harbour-compliant** SailfishOS/AuroraOS apps on Ubuntu Touch
-(Lomiri/Mir), with minimal overhead.
+Run unmodified SailfishOS apps on Ubuntu Touch (Lomiri/Mir).
 
-A Sailfish SDK target rootfs is mounted as the guest userspace inside an
-unprivileged **bubblewrap** mount namespace; **non-glvnd SFOS libhybris** is
-installed *into that rootfs* (the native Sailfish/Halium way) and loads the
-device's own `/vendor` Android GL blobs; and the guest Qt 5.6 app talks
-**directly** to Lomiri's compositor over **`wl_shell`**. A small `LD_PRELOAD`
-shim fills the gaps Lipstick would otherwise provide (ambience background,
-orientation, missing globals).
+## How it works
 
-We deliberately do **not** bind UT's host GL libs: UT ships libhybris only as a
-glvnd vendor, and glvnd's per-thread dispatch returns a null `glGetString` on
-threads it doesn't track (Gecko's compositor thread), which crashes
-hardware-accelerated web content. Non-glvnd libhybris exports the real EGL API
-and fixes that (WebView apps and the browser render on the GPU).
-
-- No container daemon (no LXC/podman/docker) — just `bwrap`.
-- No nested compositor and no protocol-translating proxy.
-
-**Status: Spike 1 PASSED on real hardware** (MediaTek/Mali, UT 24.04). A
-`wl_shell`+EGL client renders on the Mali GPU through host libhybris, inside the
-sandbox, direct to Lomiri. The full validated recipe + failure→fix log is in
-[`spike/SPIKE1-FINDINGS.md`](spike/SPIKE1-FINDINGS.md) — read it before changing the
-launcher's bind/env set.
+- A Sailfish SDK target rootfs is the guest userspace, run inside an unprivileged
+  **bubblewrap** (`bwrap`) mount namespace. No container daemon (no LXC/podman/docker).
+- The guest Qt 5.6 app talks **directly** to Lomiri's compositor over `wl_shell` —
+  no nested compositor, no protocol-translating proxy.
+- A small `LD_PRELOAD` shim fills the gaps Lipstick would normally provide
+  (ambience background, orientation, missing globals).
+- **GL:** the **SailfishOS build of libhybris** is installed *into the rootfs* and
+  loads the device's own `/vendor` Android GL blobs. UT's own libhybris is a glvnd
+  vendor, and glvnd returns a null `glGetString` on threads it doesn't track (e.g.
+  Gecko's compositor thread), which breaks GPU-accelerated web content. The
+  SailfishOS build is non-glvnd and exports the real EGL API, so WebView apps and
+  the browser render on the GPU.
 
 ## Layout
 
 | Path | What |
 |------|------|
-| `sfrun` | Python CLI: `doctor`, `bootstrap`, `prepare-gl`, `run`, `spike`. Encodes the validated bind/env recipe. |
+| `sfrun` | Python CLI: `doctor`, `bootstrap`, `prepare-gl`, `run`, … Encodes the validated bind/env recipe. |
 | `shim/sailfish_shim.c` | `LD_PRELOAD` shim: registry diagnostics + (scaffolded) opaque background and orientation. |
-| `spike/sfspike.c` | Minimal `wl_shell`+EGL/GLES2 test client (Spike 1). |
-| `spike/spike-run.sh` | The original hand-iterated bwrap invocation (reference). |
-| `spike/SPIKE1-FINDINGS.md` | Result, device facts, the working env recipe, failure→fix log. |
 | `clickable.yaml`, `click/` | Click packaging (manifest, apparmor, desktop hook, icon). |
 
-Everything runs under a writable base dir (the UT rootfs is read-only): code
-(`sfrun`, `shim/`) is located relative to the script itself and may live on a
-read-only fs; data (`rootfs/`, `home/`, `cache/`) resolves to
-`$XDG_DATA_HOME/<click package name>` (`~/.local/share/sfrun.thekit`)
-when installed as a click, or to the script dir when it already holds a
-`rootfs/` (dev layout), or to `~/.local/share/sfrun` otherwise. Override with
-`SFRUN_BASE` etc.
+**Code and data are decoupled** (the UT rootfs is read-only). Code (`sfrun`,
+`shim/`) is found relative to the script, so it can live on a read-only fs or in
+`/opt`. Data (`rootfs/`, `home/`, `cache/`) goes to `SFRUN_BASE`, which defaults
+to the script dir if it already holds a `rootfs/` (dev layout), else
+`~/.local/share/sfrun.thekit` when installed as a click, else `~/.local/share/sfrun`.
 
 ## Bring-up on a device
 
-Inside a Lomiri session, on the device:
+Run these inside a Lomiri session, on the device:
 
 ```sh
-# 1. Populate the guest rootfs from a Sailfish SDK target. With no argument the
-#    latest target is downloaded from releases.sailfishos.org (md5-verified,
-#    resumable, cached in <base>/cache). Also accepts a version (5.1.0.11), a
-#    local .tar/.tar.7z, or a dir. .tar.7z needs 7zz/7z on PATH.
+# 1. Fill the guest rootfs from a Sailfish SDK target. With no argument, the
+#    latest is downloaded from releases.sailfishos.org (md5-checked, resumable,
+#    cached). Also takes a version (5.1.0.11), a local .tar/.tar.7z, or a dir.
+#    (.tar.7z needs 7zz/7z on PATH.)
 python3 sfrun bootstrap
 
-# 2. Install the non-glvnd libhybris GL stack into the rootfs (from the SFOS
-#    Halium HW-adaptation repo; force-swaps out the SDK target's mesa-llvmpipe
-#    software GL). Run once.
+# 2. Install the SailfishOS libhybris stack into the rootfs (replaces the SDK
+#    target's software GL). Run once.
 python3 sfrun prepare-gl
 
-# 3. Patch Silica for Lomiri (disable Lipstick cover window; paint a blurred
-#    in-window ambience instead of the compositor-drawn one). Idempotent.
+# 3. Patch Silica for Lomiri (drop the Lipstick cover window; paint a blurred
+#    in-window ambience instead). Idempotent.
 python3 sfrun patch-silica
 
-# 4. Preflight.
+# 4. Check everything is ready.
 python3 sfrun doctor
-
-# 5. Prove the stack: wl_shell + EGL on the real GPU, in the sandbox.
-SFRUN_DEBUG=1 python3 sfrun spike
 ```
 
 Apps that use Silica (`libsailfishapp`) need step 3. Keep
-`QT_QPA_PLATFORM=wayland` (the default) — Silica's `desktop` mode misrenders
+`QT_QPA_PLATFORM=wayland` (the default); Silica's `desktop` mode misrenders
 (white-on-white, wrong rotation).
 
-After bootstrap, install the runtime packages the build sysroot lacks (qmlscene,
-SVG image plugin, theme graphics + the zoom matching your scale) and generate
-launchers:
+The SDK *build* sysroot lacks some runtime pieces, so after bootstrap install
+them and generate launchers:
 
 ```sh
-python3 sfrun prepare-rootfs --scale 1.5   # runtime pkgs + z1.5 graphics
+python3 sfrun prepare-rootfs --scale 1.5   # runtime pkgs + z1.5 theme graphics
 python3 sfrun set-scale 1.5                # Silica pixel ratio (user dconf)
 python3 sfrun make-desktop harbour-fernschreiber   # -> UT app drawer entry
 ```
 
-Code (script, `shim/`, `spike/`) and data (`rootfs/`, `home/`, `cache/` under
-`SFRUN_BASE`) are decoupled: `SFRUN_BASE` defaults to the script dir if it holds
-a `rootfs/`, else `$XDG_DATA_HOME/sfrun` — so the script can move to e.g.
-`/opt/clickable` while data stays in the user's home. The GL stack lives inside
-the rootfs itself (no separate `hostgl/`).
-
-**Pass:** a colour-cycling window appears and the log shows
-`GLES renderer=<your GPU>` / `OK - full path works`.
-
-Cross-compiling the test client (on an x86_64 dev host with
-`aarch64-linux-gnu-gcc`): see the build line in `spike/SPIKE1-FINDINGS.md`.
-
 ## Installing apps
 
-From the **SailfishOS:Chum** community repo (an OBS zypper repo, no PackageKit/ssu
-daemon needed — `sfrun` resolves the newest chum release at or below the rootfs
-version, adds it, and browses it with `zypper --xmlout se`):
+From the **SailfishOS:Chum** community repo (a zypper/OBS repo — no PackageKit or
+ssu daemon needed; `sfrun` picks the newest chum release at or below the rootfs
+version):
 
 ```sh
-python3 sfrun chum enable            # add + refresh the chum repo (auto release)
-python3 sfrun chum list              # id<TAB>summary<TAB>installed, one per line
-python3 sfrun install-pkg harbour-aenigma   # install a chum app (deps resolved)
+python3 sfrun chum enable                   # add + refresh the chum repo
+python3 sfrun chum list                     # id / summary / installed, one per line
+python3 sfrun install-pkg harbour-aenigma   # install (deps resolved)
 ```
 
 Or from a local `.rpm` (deps still come from the repos):
@@ -116,16 +85,14 @@ Or from a local `.rpm` (deps still come from the repos):
 python3 sfrun install-rpm ~/Downloads/harbour-foo.rpm
 ```
 
-Installing an app auto-creates its host launcher (drawer entry). To uninstall an
-app and remove its launcher + icons:
+Installing an app auto-creates its drawer launcher. To remove an app plus its
+launcher and icons:
 
 ```sh
 python3 sfrun remove harbour-foo
 ```
 
-The QML control panel ("Sailfish Apps" in the drawer) wraps all of this — a
-searchable Chum store, RPM install, and a "My apps" list — see *Control panel*
-below.
+The **Control panel** (below) wraps all of this in a GUI.
 
 ## Running apps
 
@@ -135,35 +102,28 @@ python3 sfrun run /usr/bin/harbour-someapp   # absolute path also works
 SFRUN_DEBUG=1 python3 sfrun run ...          # print the bwrap argv
 ```
 
-`run <id>` honors the app's `.desktop` `Exec`, so both compiled apps
+`run <id>` follows the app's `.desktop` `Exec`, so both compiled apps
 (`Exec=harbour-foo`) and QML-only apps (`Exec=sailfish-qml harbour-foo`) work; an
-`invoker` booster prefix is stripped. Apps that import QML modules missing from
-the rootfs (e.g. `Sailfish.WebView`/`WebEngine`, which need the embedded Gecko
-engine) load to a blank window — that's a missing dependency, not a render bug.
+`invoker` booster prefix is stripped. Apps importing QML modules missing from the
+rootfs (e.g. `Sailfish.WebView`, which needs the embedded Gecko engine) load to a
+blank window — a missing dependency, not a render bug.
 
-Build the shim (optional until Spike 2): `make -C shim`
-(cross: `make -C shim CC=aarch64-linux-gnu-gcc`).
+Apps share one guest home (`SFRUN_HOME`, default `<base>/home`) mounted at
+`/home/<device-user>` and run as the device user, so dconf is shared — like a real
+device.
 
 ## Maintenance / debugging
 
 ```sh
-python3 sfrun manage [cmd]   # writable fake-root shell w/ net+DNS (zypper/rpm/patch),
-                             # like sdk-assistant. Project dir at /sfhome.
-python3 sfrun manage zypper in /sfhome/some.rpm   # install a local RPM into the rootfs
+python3 sfrun manage [cmd]   # writable fake-root shell w/ net+DNS (zypper/rpm/patch).
+                             #   Project dir at /sfhome. bootstrap/prepare-gl/
+                             #   patch-silica are built on this.
 python3 sfrun shell  [cmd]   # shell in the app sandbox (read-only, full GL/Wayland env)
+python3 sfrun set-scale 1.5  # Silica theme pixel ratio (omit number to derive it)
 ```
 
-`bootstrap`/`prepare-gl`/`patch-silica` are built on the same `manage` sandbox.
-
-```sh
-python3 sfrun set-scale 1.5   # set Silica theme pixel ratio (user dconf); omit the
-                              # number to derive it from the GRID_UNIT_PX env / 14
-```
-
-Apps share a single guest home (`SFRUN_HOME`, default `<base>/home`) mounted at
-`/home/<device-user>` and run as the device user — like a real device, so dconf is
-shared. SVG icons/emoji need `qt5-qtsvg-plugin-imageformat-svg`
-(`sfrun manage zypper in qt5-qtsvg-plugin-imageformat-svg`).
+Build the shim: `make -C shim`
+(cross: `make -C shim CC=aarch64-linux-gnu-gcc`).
 
 ## Packaging as a click
 
@@ -171,40 +131,31 @@ shared. SVG icons/emoji need `qt5-qtsvg-plugin-imageformat-svg`
 clickable build --arch arm64      # -> sfrun.thekit_0.1.0_arm64.click
 ```
 
-Needs clickable >= 8.9 (earlier versions don't know the 24.04 frameworks and
-write the wrong apparmor `policy_version`). The bundled
-`click-review` step still fails on the new framework (outdated review DB in the
-container) plus flags `unconfined` and the intentional `/opt/click.ubuntu.com`
-self-detection string in `sfrun` — the package itself is fine; install with
-`clickable install` or `pkcon install-local --allow-untrusted`.
+Needs clickable >= 8.9 (older versions don't know the 24.04 frameworks and write
+the wrong apparmor `policy_version`). The click is `unconfined` because bwrap
+needs user namespaces; the bundled `click-review` fails on the new framework
+(outdated review DB) but the package is fine — install with `clickable install`
+or `pkcon install-local --allow-untrusted`.
 
-The click (framework `ubuntu-touch-24.04-1.x`, apparmor `unconfined` — bwrap
-needs user namespaces) ships only code: `sfrun`, the cross-built shim, and the
-hooks from `click/`. It installs under
-`/opt/click.ubuntu.com/sfrun.thekit/<version>/`; `sfrun` detects that
-location and keeps all data in `~/.local/share/sfrun.thekit/`.
-`make-desktop` launchers point at the package's `current` symlink, so they
-survive upgrades.
+The click ships only code (`sfrun`, the cross-built shim, the `click/` hooks). It
+installs under `/opt/click.ubuntu.com/sfrun.thekit/<version>/`; `sfrun` detects
+that and keeps all data in `~/.local/share/sfrun.thekit/`. `make-desktop`
+launchers point at the package's `current` symlink, so they survive upgrades.
 
 ### Control panel
 
-The click's desktop entry launches a Lomiri/PyOtherSide QML app (`ui/Main.qml`
-+ `ui/backend.py`) that drives `sfrun` as a subprocess: a status/`doctor` card,
-one-tap **Bootstrap** (with download progress) and **Setup**, a searchable
-**Chum store**, **Install from .rpm**, and a **My apps** list (run + add-to-drawer).
-Everything it does is a plain `sfrun` subcommand, so the CLI and GUI stay in sync.
+The click's desktop entry launches a Lomiri/PyOtherSide QML app (`ui/Main.qml` +
+`ui/backend.py`) that drives `sfrun` as a subprocess: a status/`doctor` card,
+one-tap **Bootstrap** and **Setup**, a searchable **Chum store**, **Install from
+.rpm**, and a **My apps** list. Everything it does is a plain `sfrun` subcommand,
+so CLI and GUI stay in sync.
 
-## Next steps (per the plan)
+## Next steps
 
-2. **Silica hello** — the SDK *build sysroot* lacks runtime pieces (`qmlscene`,
-   Silica QML, `jolla-ambient` theme). Install those runtime packages into the
-   rootfs (or pull from a device image), run a minimal `ApplicationWindow`+`Page`,
-   and observe the ambience-background artefact.
-3. **Shim hardening** — land opaque-background + orientation in `sailfish_shim.c`;
-   stub any mandatory missing global the registry diagnostics reveal.
-4. **Real Harbour app**, then **packaging** as a click + per-app `.desktop`
-   (click scaffolding now in `clickable.yaml` + `click/`; needs on-device
-   validation).
+- **Shim hardening** — land opaque-background + orientation in `sailfish_shim.c`;
+  stub any mandatory missing global the registry diagnostics reveal.
+- **Real Harbour apps** at scale, then harden the click packaging with on-device
+  validation.
 
 ## Env knobs
 
