@@ -1,0 +1,46 @@
+name: Build click package (arm64)
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # GitHub's runners ship both docker and podman; Clickable prefers podman,
+    # whose rootless UID mapping fails on the arm64 image ("container ID …
+    # cannot be mapped to a host ID"). Force the (rootful) docker backend.
+    env:
+      CLICKABLE_DOCKER_COMMAND: docker
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Clickable
+        run: pip3 install 'clickable-ut>=8.8.0'
+
+      # --accept-review-errors: the package intentionally trips two click-review
+      # checks — the 'unconfined' apparmor profile (bwrap needs user namespaces)
+      # and the '/opt/click.ubuntu.com/' self-detection string in sfrun.
+      - name: Build click package
+        run: clickable build --arch arm64 --non-interactive --accept-review-errors
+
+      - name: Upload click package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfrun-arm64
+          path: build/*/app/*.click
+          if-no-files-found: error
+
+      # Publish a GitHub release when a v* tag is pushed.
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*/app/*.click
