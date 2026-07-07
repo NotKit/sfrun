@@ -99,23 +99,55 @@ static void logging_global(void *data, struct wl_proxy *registry,
 typedef int (*wl_proxy_add_listener_t)(struct wl_proxy *proxy,
                                        void (**impl)(void), void *data);
 
+/* Resolve the real libwayland-client wl_proxy_add_listener.
+ *
+ * dlsym(RTLD_NEXT) alone is NOT enough: a real Qt app reaches wayland by
+ * dlopen()ing the QPA platform plugin, which pulls libwayland-client into a
+ * *local* link-map scope. RTLD_NEXT only searches the global scope, so it
+ * returns NULL there and forwarding would call through a null pointer (crash in
+ * QWaylandDisplay's registry init). The Spike 1 test client linked
+ * libwayland-client directly (global scope), which is why it never hit this.
+ * Fall back to dlopen'ing the library and promoting it to the global scope. */
+static wl_proxy_add_listener_t resolve_real_add_listener(void) {
+    wl_proxy_add_listener_t f =
+        (wl_proxy_add_listener_t)dlsym(RTLD_NEXT, "wl_proxy_add_listener");
+    if (f) return f;
+    void *h = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
+    if (!h) h = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (h) f = (wl_proxy_add_listener_t)dlsym(h, "wl_proxy_add_listener");
+    return f;
+}
+
 /* Must be exported (default visibility) so the dynamic linker resolves the
  * app's calls here ahead of libwayland-client's. */
 __attribute__((visibility("default")))
 int wl_proxy_add_listener(struct wl_proxy *proxy,
                           void (**impl)(void), void *data) {
     static wl_proxy_add_listener_t real;
-    if (!real) real = (wl_proxy_add_listener_t)dlsym(RTLD_NEXT, "wl_proxy_add_listener");
+    if (!real) real = resolve_real_add_listener();
+    if (!real) {
+        /* Never call through a null pointer. Without the real symbol we cannot
+         * register the listener; report failure and let the app handle it
+         * rather than segfaulting the whole process. */
+        shim_log("ERROR: cannot resolve real wl_proxy_add_listener; not forwarding");
+        return -1;
+    }
 
-    /* Heuristic: a registry listener's first slot is the `global` callback.
-     * We can't cheaply prove the proxy is a wl_registry from here, so we only
-     * wrap when diagnostics are on, keeping the production path untouched. */
-    if (debug_enabled() && impl && impl[0]) {
-        struct wl_registry_listener *l = (struct wl_registry_listener *)impl;
-        if (!real_global_cb) {
-            real_global_cb = l->global;
-            l->global = logging_global;
+    /* Diagnostics (debug only): log every advertised global by wrapping the
+     * registry listener's `global` callback. Heuristic: the first add_listener
+     * with a non-null first slot is QWaylandDisplay's registry listener.
+     * Must NOT write into the caller's array — Qt's wl_registry_listener lives
+     * in .rodata, so mutating it segfaults. Forward a heap copy instead. */
+    if (debug_enabled() && impl && impl[0] && !real_global_cb) {
+        real_global_cb = (wl_registry_global_t)impl[0];
+        void (**copy)(void) = malloc(2 * sizeof(*copy));  /* {global, global_remove} */
+        if (copy) {
+            copy[0] = (void (*)(void))logging_global;
+            copy[1] = impl[1];
             shim_log("registry listener wrapped for diagnostics");
+            /* copy outlives this call (wayland keeps the pointer); leaked on
+             * purpose — one per registry, for the life of the process. */
+            return real(proxy, copy, data);
         }
     }
     return real(proxy, impl, data);
