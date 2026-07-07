@@ -772,11 +772,13 @@ def cmd_install_rpm(args) -> int:
     if rpm.resolve() != staged.resolve():
         shutil.copy(rpm, staged)
     print(f"installing {rpm.name}")
+    before = app_desktop_ids()
     argv = manage_argv(["zypper", "--non-interactive", "--no-gpg-checks", "in",
                         f"/sfhome/cache/{rpm.name}"])
     r = subprocess.run(argv)
     if r.returncode not in (0, 4):
         die(f"zypper install failed (exit {r.returncode})")
+    report_new_launchers(before)
     print("done.")
     return 0
 
@@ -876,10 +878,12 @@ def cmd_install_pkg(args) -> int:
     if not ROOTFS.is_dir():
         die(f"guest rootfs not found at {ROOTFS}; run `sfrun bootstrap` first")
     print(f"installing {args.pkg}")
+    before = app_desktop_ids()
     r = subprocess.run(manage_argv(
         ["zypper", "--non-interactive", "--no-gpg-checks", "in", args.pkg]))
     if r.returncode not in (0, 4):
         die(f"zypper install failed (exit {r.returncode})")
+    report_new_launchers(before)
     print("done.")
     return 0
 
@@ -887,48 +891,52 @@ def cmd_install_pkg(args) -> int:
 # App-id prefixes for third-party (Jolla Store / Chum / OpenRepos) apps — what a
 # user actually installs, as opposed to the SDK rootfs's own system entries.
 APP_PREFIXES = ("harbour-", "openrepos-")
+HOST_APPS = Path.home() / ".local/share/applications"
+HOST_ICONS = Path.home() / ".local/share/icons/hicolor"
 
 
-def cmd_list_apps(_args) -> int:
-    """List installable third-party apps present in the rootfs, TAB-separated as
-    `id<TAB>name<TAB>has_launcher(0|1)` — one per line, for the GUI to parse."""
+def _desktop_hidden(text: str) -> bool:
+    """True if a .desktop entry should not surface as a launchable app."""
+    for line in text.splitlines():
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        if k == "NoDisplay" and v.lower() == "true":
+            return True
+        if k == "Type" and v and v != "Application":
+            return True
+    return False
+
+
+def app_desktop_ids() -> set[str]:
+    """All visible Application .desktop ids currently in the rootfs (any name)."""
     appsdir = ROOTFS / "usr/share/applications"
-    host_apps = Path.home() / ".local/share/applications"
+    ids: set[str] = set()
     if not appsdir.is_dir():
-        return 0
-    for desk in sorted(appsdir.glob("*.desktop")):
-        appid = desk.stem
-        if not appid.startswith(APP_PREFIXES):
-            continue
-        name, hidden = appid, False
+        return ids
+    for desk in appsdir.glob("*.desktop"):
         try:
-            for line in desk.read_text(errors="replace").splitlines():
-                k, _, v = line.partition("=")
-                k, v = k.strip(), v.strip()
-                if k == "Name" and name == appid:
-                    name = v
-                elif k == "NoDisplay" and v.lower() == "true":
-                    hidden = True
+            if not _desktop_hidden(desk.read_text(errors="replace")):
+                ids.add(desk.stem)
         except OSError:
             pass
-        if hidden:
-            continue
-        launched = 1 if (host_apps / f"sfrun-{appid}.desktop").exists() else 0
-        print(f"{appid}\t{name}\t{launched}")
-    return 0
+    return ids
 
 
-def cmd_make_desktop(args) -> int:
-    """Generate a host .desktop launcher for an installed app, derived from the
-    app's own .desktop inside the target, with Exec rewritten to call this sfrun.
-    Icons are copied into the host XDG icon dir so the entry is path-independent."""
-    appid = args.app
+def has_launcher(appid: str) -> bool:
+    return (HOST_APPS / f"sfrun-{appid}.desktop").exists()
+
+
+def write_launcher(appid: str) -> int:
+    """Create a host .desktop launcher for an installed app, derived from the
+    app's own .desktop in the rootfs (Exec rewritten to call this sfrun; icons
+    copied into the host theme so it resolves path-independently). Returns the
+    number of icon files copied. Raises FileNotFoundError if the app has none."""
     src = ROOTFS / "usr/share/applications" / f"{appid}.desktop"
     if not src.is_file():
-        die(f"{src} not found; is '{appid}' installed in the rootfs?")
+        raise FileNotFoundError(src)
 
-    launcher = stable_self()  # click installs: use the `current` symlink so the
-    icon_name = None          # launcher survives package upgrades
+    launcher = stable_self()  # click installs: the `current` symlink survives upgrades
+    icon_name = None
     out_lines: list[str] = []
     for line in src.read_text().splitlines():
         key = line.split("=", 1)[0].strip() if "=" in line else ""
@@ -942,24 +950,83 @@ def cmd_make_desktop(args) -> int:
         else:
             out_lines.append(line)
 
-    # Copy the app's icons from the target into the host XDG icon theme so the
-    # launcher resolves them without referencing the rootfs path.
     copied = 0
     if icon_name and not icon_name.startswith("/"):
-        host_icons = Path.home() / ".local/share/icons/hicolor"
         for png in (ROOTFS / "usr/share/icons/hicolor").glob(f"*/apps/{icon_name}.*"):
             rel = png.relative_to(ROOTFS / "usr/share/icons/hicolor")
-            dst = host_icons / rel
+            dst = HOST_ICONS / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(png, dst)
             copied += 1
 
-    apps_dir = Path.home() / ".local/share/applications"
-    apps_dir.mkdir(parents=True, exist_ok=True)
-    out = apps_dir / f"sfrun-{appid}.desktop"
+    HOST_APPS.mkdir(parents=True, exist_ok=True)
+    out = HOST_APPS / f"sfrun-{appid}.desktop"
     out.write_text("\n".join(out_lines) + "\n")
     out.chmod(0o755)
-    print(f"wrote {out}\n  Exec={launcher} run {appid}\n  icons copied: {copied}")
+    return copied
+
+
+def create_launchers(appids) -> list[str]:
+    """Write host launchers for the given app ids that don't have one; return the
+    ids actually created."""
+    created = []
+    for appid in sorted(appids):
+        if has_launcher(appid):
+            continue
+        try:
+            write_launcher(appid)
+            created.append(appid)
+        except OSError:
+            pass
+    return created
+
+
+def report_new_launchers(before: set[str]) -> None:
+    """After an install, auto-create launchers for apps that newly appeared, so
+    installed apps land in the UT app drawer without a separate step."""
+    created = create_launchers(app_desktop_ids() - before)
+    if created:
+        print("added to app drawer: " + ", ".join(created))
+
+
+def cmd_list_apps(_args) -> int:
+    """List launchable apps in the rootfs, TAB-separated as
+    `id<TAB>name<TAB>has_launcher(0|1)`. Shows third-party (harbour-/openrepos-)
+    apps plus anything that already has a host launcher."""
+    appsdir = ROOTFS / "usr/share/applications"
+    if not appsdir.is_dir():
+        return 0
+    for desk in sorted(appsdir.glob("*.desktop")):
+        appid = desk.stem
+        launched = has_launcher(appid)
+        if not appid.startswith(APP_PREFIXES) and not launched:
+            continue
+        try:
+            text = desk.read_text(errors="replace")
+        except OSError:
+            continue
+        if _desktop_hidden(text):
+            continue
+        name = appid
+        for line in text.splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == "Name":
+                name = v.strip()
+                break
+        print(f"{appid}\t{name}\t{1 if launched else 0}")
+    return 0
+
+
+def cmd_make_desktop(args) -> int:
+    """Generate a host .desktop launcher for one installed app (manual; installs
+    now do this automatically)."""
+    try:
+        copied = write_launcher(args.app)
+    except FileNotFoundError as e:
+        die(f"{e} not found; is '{args.app}' installed in the rootfs?")
+        return 1
+    print(f"wrote {HOST_APPS / ('sfrun-' + args.app + '.desktop')}\n"
+          f"  Exec={stable_self()} run {args.app}\n  icons copied: {copied}")
     return 0
 
 
